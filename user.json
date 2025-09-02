@@ -1,0 +1,10 @@
+{
+  "users": [
+    {
+      "username": "abdulhodiy",
+      "password": "hashedpassword123",
+      "avatar": "/usr/share/dragonos/avatars/default.png",
+      "last_login": "2025-08-24T15:00:00"
+    }
+  ]
+}
