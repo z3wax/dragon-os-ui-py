@@ -1,0 +1,9 @@
+#!/bin/sh
+# DragonOS launcher (Alpine Linux)
+# Keeps the working directory correct so wallpapers/assets load.
+DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+[ -z "$DIR" ] && DIR="/opt/dragon-os-ui-py"
+
+export GDK_BACKEND="${GDK_BACKEND:-x11}"
+export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-x11}"
+exec python3 "$DIR/main.py" "$@"

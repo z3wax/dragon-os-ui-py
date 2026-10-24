@@ -1,8 +1,8 @@
-# Modern greeter for DragonOS (GTK3)
+# Modern greeter for DragonOS (GTK3) — Alpine Edition
 # - JSON-based user database (PBKDF2)
 # - Non-blocking auth
-# - Polished, modern UI (glass card, subtle animations, inline errors)
-# - Robust CapsLock indicator
+# - Polished glass UI: gradient backdrop, monogram avatar, inline errors
+# - Alpine-friendly power actions
 import gi
 import os
 import sys
@@ -12,11 +12,18 @@ import getpass
 import threading
 import hashlib
 import binascii
+import subprocess
 from pathlib import Path
 
 # ---- GTK ----
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, Gdk, GLib
+from gi.repository import Gtk, Gdk, GLib, Pango, Gio
+
+try:
+    import cairo
+    HAVE_CAIRO = True
+except Exception:
+    HAVE_CAIRO = False
 
 # ---- Optional PAM (kept for compatibility; JSON is primary) ----
 USE_PAM = False
@@ -33,7 +40,7 @@ except Exception:
     except Exception:
         USE_PAM = False
 
-from oos_ui import Desktop, DESKTOP_FOLDER
+from oos_ui import Desktop, DESKTOP_FOLDER, theme_icon
 from helpers import ensure_desktop_folder, load_icon
 
 logging.basicConfig(level=logging.INFO)
@@ -172,6 +179,56 @@ def get_local_users():
 #                         LOGIN WINDOW
 # =============================================================
 
+class MonogramAvatar(Gtk.DrawingArea):
+    """Circular gradient avatar with a monogram letter (no emoji fonts needed)."""
+
+    def __init__(self, letter="D", size=96):
+        super().__init__()
+        self.letter = letter
+        self.size = size
+        self.set_size_request(size, size)
+        try:
+            self.connect("draw", self._draw)
+        except Exception:
+            pass
+
+    def _draw(self, widget, cr):
+        try:
+            alloc = widget.get_allocation()
+            w, h = alloc.width, alloc.height
+            cx, cy, r = w / 2.0, h / 2.0, min(w, h) / 2.0
+
+            grad = cairo.LinearGradient(0, 0, w, h)
+            grad.add_color_stop_rgba(0.0, 0.486, 0.549, 1.0, 1.0)   # #7c8cff
+            grad.add_color_stop_rgba(1.0, 0.659, 0.333, 0.969, 1.0) # #a855f7
+            cr.set_source(grad)
+            cr.arc(cx, cy, r, 0, 2.0 * 3.141592653589793)
+            cr.fill()
+
+            soft = cairo.RadialGradient(cx, cy - r * 0.35, 0, cx, cy, r)
+            soft.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.35)
+            soft.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.0)
+            cr.set_source(soft)
+            cr.arc(cx, cy, r, 0, 2.0 * 3.141592653589793)
+            cr.fill()
+
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.96)
+            cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            cr.set_font_size(r * 0.72)
+            ext = cr.text_extents(self.letter)
+            cr.move_to(cx - ext.width / 2.0 - ext.x_bearing,
+                       cy - ext.height / 2.0 - ext.y_bearing)
+            cr.show_text(self.letter)
+
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.55)
+            cr.set_line_width(2.5)
+            cr.arc(cx, cy, r - 2.5, 0, 2.0 * 3.141592653589793)
+            cr.stroke()
+        except Exception:
+            pass
+        return False
+
+
 class LoginWindow(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="DragonOS")
@@ -179,6 +236,13 @@ class LoginWindow(Gtk.ApplicationWindow):
         self.set_default_size(720, 480)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_resizable(False)
+        self.set_name("greeter")
+        try:
+            visual = self.get_screen().get_rgba_visual()
+            if visual:
+                self.set_visual(visual)
+        except Exception:
+            pass
 
         # enable key events
         self.add_events(Gdk.EventMask.KEY_PRESS_MASK)
@@ -187,7 +251,7 @@ class LoginWindow(Gtk.ApplicationWindow):
         overlay = Gtk.Overlay()
         self.add(overlay)
 
-        # Background
+        # Background gradient layer
         bg = Gtk.EventBox()
         bg.set_name("bg")
         overlay.add(bg)
@@ -200,29 +264,29 @@ class LoginWindow(Gtk.ApplicationWindow):
 
         # Card/frame
         card = Gtk.Frame()
+        card.set_name("greeter-card")
         card.set_shadow_type(Gtk.ShadowType.NONE)
-        card.set_size_request(560, 390)
-        card_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
-        card_box.set_border_width(24)
+        card.set_size_request(404, 386)
+        card_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        card_box.set_border_width(28)
         card.add(card_box)
         root.pack_start(card, False, False, 0)
 
-        # Avatar (static default; could be personalized per user on change)
-        self.avatar_box = Gtk.EventBox()
-        self.avatar_box.set_size_request(96, 96)
+        # Avatar: gradient monogram (no emoji/icon fonts needed)
+        self.avatar_box = Gtk.Box()
         self.avatar_box.set_halign(Gtk.Align.CENTER)
         try:
-            avatar_img = load_icon("avatar-default", size=96)
+            avatar = MonogramAvatar(letter="D", size=92)
         except Exception:
-            avatar_img = Gtk.Image.new_from_icon_name("avatar-default", Gtk.IconSize.DIALOG)
-        self.avatar_box.add(avatar_img)
+            avatar = Gtk.Image.new_from_icon_name("avatar-default", Gtk.IconSize.DIALOG)
+        self.avatar_box.add(avatar)
         card_box.pack_start(self.avatar_box, False, False, 0)
 
         # Title & subtitle
-        title = Gtk.Label(label="Welcome to DragonOS")
+        title = Gtk.Label(label="DragonOS")
         title.get_style_context().add_class("greeter-title")
         title.set_halign(Gtk.Align.CENTER)
-        subtitle = Gtk.Label(label="Sign in with your account")
+        subtitle = Gtk.Label(label="Sign in to your account")
         subtitle.get_style_context().add_class("greeter-subtitle")
         subtitle.set_halign(Gtk.Align.CENTER)
         card_box.pack_start(title, False, False, 0)
@@ -238,7 +302,7 @@ class LoginWindow(Gtk.ApplicationWindow):
         self.user_combo.set_hexpand(True)
         self._populate_users()
         self.user_combo.connect("changed", self._on_user_changed)
-        inputs.pack_start(self._row(self.user_combo, "👤"), False, False, 0)
+        inputs.pack_start(self._row(self.user_combo, "avatar-default-symbolic"), False, False, 0)
 
         # Password with reveal
         self.pw = Gtk.Entry()
@@ -250,9 +314,13 @@ class LoginWindow(Gtk.ApplicationWindow):
         self.reveal_btn = Gtk.ToggleButton()
         self.reveal_btn.set_relief(Gtk.ReliefStyle.NONE)
         try:
-            self.reveal_btn.set_image(load_icon("view-password-symbolic", size=18))
+            theme = Gtk.IconTheme.get_default()
+            icon_name = ("view-reveal-symbolic"
+                         if theme.has_icon("view-reveal-symbolic")
+                         else "view-password-symbolic")
+            self.reveal_btn.set_image(theme_icon(icon_name, 18))
         except Exception:
-            self.reveal_btn.set_label("👁")
+            self.reveal_btn.set_label("*")
         self.reveal_btn.connect("toggled", self.on_reveal_toggled)
 
         pw_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -305,9 +373,13 @@ class LoginWindow(Gtk.ApplicationWindow):
         shutdown_btn.set_relief(Gtk.ReliefStyle.NONE)
         shutdown_btn.set_tooltip_text("Shutdown")
         try:
-            shutdown_btn.set_image(load_icon("system-shutdown", size=16))
+            theme = Gtk.IconTheme.get_default()
+            icon = ("system-shutdown-symbolic"
+                    if theme.has_icon("system-shutdown-symbolic")
+                    else "system-shutdown")
+            shutdown_btn.set_image(theme_icon(icon, 16))
         except Exception:
-            shutdown_btn.set_label("⏻")
+            shutdown_btn.set_label("@")
         shutdown_btn.connect("clicked", self.on_shutdown)
         footer.pack_start(shutdown_btn, False, False, 0)
         card_box.pack_end(footer, False, False, 0)
@@ -331,8 +403,12 @@ class LoginWindow(Gtk.ApplicationWindow):
     def _row(self, widget: Gtk.Widget, prefix_text: str = "") -> Gtk.Box:
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         if prefix_text:
-            pre = Gtk.Label(label=prefix_text)
-            pre.get_style_context().add_class("prefix")
+            if " " not in prefix_text:
+                pre = theme_icon(prefix_text, 16)
+                pre.get_style_context().add_class("prefix-icon")
+            else:
+                pre = Gtk.Label(label=prefix_text)
+                pre.get_style_context().add_class("prefix")
             row.pack_start(pre, False, False, 0)
         row.pack_start(widget, True, True, 0)
         return row
@@ -374,28 +450,63 @@ class LoginWindow(Gtk.ApplicationWindow):
 
     # --- CSS ---
     def apply_css(self):
-        css = b"""
+        css = """
+        /* DragonOS greeter - glass design (Alpine Edition) */
         window { background: #0b0e13; }
-        #bg { background-image: linear-gradient(135deg, rgba(56,189,248,0.06), rgba(139,92,246,0.06)); }
-        frame { background: rgba(255,255,255,0.06); border-radius: 18px; border: 1px solid rgba(255,255,255,0.08); }
-        .greeter-title { font-size: 22px; color: #ffffff; font-weight: 700; }
-        .greeter-subtitle { font-size: 12px; color: #c9d1d9; padding-bottom: 4px; }
+        window.frame { border-radius: 16px; }
+        #bq { background: transparent; }
+        #bg {
+          background-image: radial-gradient(120% 90% at 12% 8%, rgba(124,140,255,0.16), rgba(0,0,0,0)),
+                            radial-gradient(110% 90% at 88% 92%, rgba(168,85,247,0.16), rgba(0,0,0,0)),
+                            linear-gradient(to bottom, #0d1120, #0b0e13);
+        }
+        #greeter-card {
+          background: rgba(17, 21, 30, 0.74);
+          border-radius: 22px;
+          border: 1px solid rgba(255,255,255,0.10);
+          box-shadow: inset 0 1px 0 rgba(255,255,255,0.07),
+                      0 24px 60px rgba(0,0,0,0.55);
+        }
+        .greeter-title {
+          font-size: 26px; color: #ffffff; font-weight: 800; letter-spacing: 1px;
+          text-shadow: none;
+        }
+        .greeter-subtitle { font-size: 12px; color: rgba(233,240,252,0.66); padding-bottom: 2px; }
         .prefix { color: #aeb6c2; padding: 8px 6px 8px 8px; }
+        .prefix-icon { margin-left: 8px; opacity: 0.75; }
         eventbox { background: transparent; }
-        eventbox image { border-radius: 48px; }
-        combo { }
-        combobox, entry { background: rgba(255,255,255,0.08); color: #fff; padding: 10px; border-radius: 10px; }
+        combobox, entry {
+          background: rgba(255,255,255,0.07); color: #ffffff; padding: 9px;
+          border-radius: 12px; border: 1px solid rgba(255,255,255,0.07);
+          box-shadow: inset 0 1px 2px rgba(0,0,0,0.25);
+          caret-color: #7c8cff; transition: background 120ms ease-out;
+        }
         entry:focus, combobox:focus { background: rgba(255,255,255,0.12); }
-        button.primary { background-color: #6a79ff; color: #fff; border-radius: 10px; padding: 10px 14px; }
-        button.primary:active { background-color: #5867ff; }
-        button { background: rgba(255,255,255,0.04); color: #e2e8f0; border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; padding: 8px 12px; }
-        button:hover { background: rgba(255,255,255,0.07); }
+        button.primary {
+          background-image: linear-gradient(120deg, #7c8cff, #a855f7);
+          color: #ffffff; border-radius: 12px; padding: 10px 16px;
+          font-weight: 700; border: none;
+          transition: all 140ms ease-out;
+        }
+        button.primary:hover { padding: 10px 18px; }
+        button.primary:active { background-image: linear-gradient(120deg, #6a76ee, #9147e0); }
+        button {
+          background: rgba(255,255,255,0.05); color: #e8eefc;
+          border-radius: 12px; padding: 8px 14px;
+          border: 1px solid rgba(255,255,255,0.07); font-weight: 600;
+          transition: all 130ms ease-out;
+        }
+        button:hover { background: rgba(255,255,255,0.10); }
+        button:active { background: rgba(124,140,255,0.28); }
+        button.image-button { padding: 8px; border-radius: 10px; }
         .caps { color: #ffb86b; font-size: 11px; }
-        .error { color: #ff6b6b; font-size: 11px; padding-right: 4px; }
+        .error { color: #ff7b7b; font-size: 11px; padding-right: 4px; }
         spinner { margin-left: 6px; }
+        combobox { color: #ffffff; }
+        label { color: #dfe7f3; }
         """
         provider = Gtk.CssProvider()
-        provider.load_from_data(css)
+        provider.load_from_data(css.encode("utf-8"))
         screen = Gdk.Screen.get_default()
         Gtk.StyleContext.add_provider_for_screen(screen, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
@@ -529,14 +640,25 @@ class LoginWindow(Gtk.ApplicationWindow):
     def on_shutdown(self, *_):
         q = Gtk.MessageDialog(transient_for=self, flags=0,
                               message_type=Gtk.MessageType.QUESTION, buttons=Gtk.ButtonsType.OK_CANCEL,
-                              text="Shutdown the system?")
+                              text="Power off the system?")
+        q.set_modal(True)
+        q.format_secondary_text("Make sure unsaved work has been saved.")
         resp = q.run(); q.destroy()
         if resp == Gtk.ResponseType.OK:
             try:
                 if sys.platform == "darwin":
                     os.system('osascript -e \'tell app "System Events" to shut down\'')
+                elif sys.platform.startswith("win"):
+                    os.system("shutdown /s /t 0")
                 else:
-                    os.system("pkexec shutdown -h now || systemctl poweroff || shutdown -h now")
+                    # Alpine-friendly: doas/sudo first, then polkit, then plain poweroff
+                    for cmd in ("doas -n poweroff", "sudo -n poweroff",
+                                "pkexec poweroff", "loginctl poweroff", "poweroff"):
+                        if subprocess.call(["sh", "-c", cmd],
+                                           stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL) == 0:
+                            return
+                    LOG.error("Poweroff failed: no privileged power command succeeded")
             except Exception:
                 LOG.exception("Shutdown failed")
 

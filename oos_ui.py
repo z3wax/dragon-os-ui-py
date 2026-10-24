@@ -1,16 +1,19 @@
-# Ultra-minimal DragonOS desktop UI (GTK3) - enhanced (fixed)
+# DragonOS Desktop UI (GTK3) — Alpine Edition
+# Modern glass desktop: top status bar, magnifying dock, launchpad, spotlight,
+# real battery/network from sysfs, Alpine-friendly power actions, smooth parallax.
 import gi
 import os
 import json
-import stat
 import sys
 import shutil
 import difflib
 import uuid
+import subprocess
+from datetime import datetime
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Pango
+from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, Pango, GObject
 
 from helpers import make_target_entries, info_dialog, load_icon, ensure_desktop_folder
 from apps import Notepad, Calculator, Gallery, FileManager, MusicPlayer, SettingsDialog
@@ -18,21 +21,30 @@ from apps import Notepad, Calculator, Gallery, FileManager, MusicPlayer, Setting
 APP_TITLE = "DragonOS"
 DESKTOP_FOLDER = os.path.expanduser("~/Desktop")
 STATE_FILE = os.path.join(DESKTOP_FOLDER, ".desktop_state.json")
-# fixed wallpaper filename checks
 DEFAULT_WALLPAPER = os.path.abspath("wallpaper.png") if os.path.exists("wallpaper.png") else None
 
 APPS = {
-    "Notepad": "accessories-text-editor",
-    "Calculator": "accessories-calculator",
-    "Gallery": "media-photo-manager",
+    "Terminal": "utilities-terminal",
     "FileManager": "folder",
+    "Notepad": "accessories-text-editor",
+    "Gallery": "multimedia-photo-viewer",
     "MusicPlayer": "media-playback-start",
+    "Calculator": "accessories-calculator",
     "Settings": "emblem-system",
 }
 
-ICON_SIZE = 56
+ICON_SIZE = 52
 SNAP_TO_GRID = True
 GRID_SIZE = 56
+
+ACCENT = "#7c8cff"
+ACCENT2 = "#a855f7"
+BgTint = "#0b0e13"
+
+TEXT_EXTS = (".txt", ".py", ".md", ".json", ".log", ".cfg", ".ini")
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi")
+
 
 # ---------- Small utilities ----------
 
@@ -45,27 +57,21 @@ def image_average_luminance(path):
         stride = small.get_rowstride()
         total = 0.0
         cnt = 0
-        h = small.get_height()
-        w = small.get_width()
-        # pixels is a bytes-like object; indexing returns ints in Python 3
-        for yy in range(h):
+        for yy in range(small.get_height()):
             row_off = yy * stride
-            for xx in range(w):
+            for xx in range(small.get_width()):
                 off = row_off + xx * ch
-                # guard bounds
                 if off + 2 < len(pixels):
                     r = pixels[off]
                     g = pixels[off + 1]
                     b = pixels[off + 2]
-                    lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
-                    total += lum
+                    total += (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
                     cnt += 1
         return (total / cnt) if cnt else 0.5
     except Exception:
         return 0.5
 
 
-# fuzzy matching helper
 def fuzzy_matches(query, choices, cutoff=0.45):
     q = (query or "").lower()
     if not q:
@@ -74,21 +80,19 @@ def fuzzy_matches(query, choices, cutoff=0.45):
     return [c for s, c in sorted(scores, reverse=True) if s >= cutoff]
 
 
-# fade helpers for simple animations
 def fade_in(win, duration=180):
     steps = 12
     step_ms = max(1, int(duration / steps))
+    idx = [0]
 
-    def step(i=[0]):
+    def step():
+        idx[0] += 1
         try:
-            i[0] += 1
-            win.set_opacity(min(1.0, i[0] / steps))
+            win.set_opacity(min(1.0, idx[0] / steps))
             win.show_all()
-            if i[0] >= steps:
-                return False
-            return True
         except Exception:
             return False
+        return idx[0] < steps
 
     try:
         win.set_opacity(0.0)
@@ -104,21 +108,22 @@ def fade_in(win, duration=180):
 def fade_out(win, duration=160):
     steps = 10
     step_ms = max(1, int(duration / steps))
+    idx = [0]
 
-    def step(i=[0]):
+    def step():
+        idx[0] += 1
         try:
-            i[0] += 1
-            win.set_opacity(max(0.0, 1.0 - i[0] / steps))
-            if i[0] >= steps:
-                try:
-                    win.hide()
-                except Exception:
-                    pass
-                win.set_opacity(1.0)
-                return False
-            return True
+            win.set_opacity(max(0.0, 1.0 - idx[0] / steps))
         except Exception:
             return False
+        if idx[0] >= steps:
+            try:
+                win.hide()
+                win.set_opacity(1.0)
+            except Exception:
+                pass
+            return False
+        return True
 
     try:
         GLib.timeout_add(step_ms, step)
@@ -129,234 +134,385 @@ def fade_out(win, duration=160):
             pass
 
 
+def enable_rounded_window(win):
+    """Allow CSS rounded corners/translucency when a compositor provides RGBA."""
+    try:
+        screen = win.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            win.set_visual(visual)
+        win.set_app_paintable(True)
+        win.connect("draw", _rounded_draw)
+    except Exception:
+        pass
+
+
+def _rounded_draw(widget, cr):
+    try:
+        ctx = widget.get_style_context()
+        alloc = widget.get_allocation()
+        Gtk.render_background(ctx, cr, 0, 0, alloc.width, alloc.height)
+    except Exception:
+        pass
+    return False
+
+
+def _read_sys(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def battery_state():
+    """(percent or None, charging: bool) from /sys/class/power_supply (no deps)."""
+    try:
+        for name in os.listdir("/sys/class/power_supply"):
+            ul = name.upper()
+            if not (ul.startswith("BAT") or "battery" in name.lower() or ul == "C1"):
+                continue
+            base = os.path.join("/sys/class/power_supply", name)
+            cap = _read_sys(os.path.join(base, "capacity"))
+            try:
+                pct = int(float(cap))
+            except Exception:
+                full = _read_sys(os.path.join(base, "charge_full")) or _read_sys(os.path.join(base, "energy_full"))
+                now = _read_sys(os.path.join(base, "charge_now")) or _read_sys(os.path.join(base, "energy_now"))
+                try:
+                    pct = int(round(float(now) / float(full) * 100)) if full else None
+                except Exception:
+                    pct = None
+            if pct is None:
+                continue
+            status = _read_sys(os.path.join(base, "status")).lower()
+            return max(0, min(100, pct)), status in ("charging", "full")
+    except Exception:
+        pass
+    return None, False
+
+
+def network_state():
+    """'wireless' | 'wired' | None from /sys/class/net (no deps)."""
+    try:
+        for name in sorted(os.listdir("/sys/class/net")):
+            if name == "lo" or name.startswith(("docker", "veth", "virbr", "vmnet")):
+                continue
+            base = os.path.join("/sys/class/net", name)
+            operstate = _read_sys(os.path.join(base, "operstate")).lower()
+            carrier = _read_sys(os.path.join(base, "carrier"))
+            if operstate in ("up", "unknown") and carrier in ("1", ""):
+                return "wireless" if name.startswith(("wl", "ra", "az")) else "wired"
+    except Exception:
+        pass
+    return None
+
+
+def battery_icon_name(pct, charging):
+    if pct is None:
+        return None
+    name = "battery-full-charging-symbolic" if charging else "battery-full-symbolic"
+    if pct <= 85:
+        name = ("battery-good" if pct > 40 else "battery-caution") + ("-charging" if charging else "") + "-symbolic"
+    theme = Gtk.IconTheme.get_default()
+    if not theme.has_icon(name):
+        name = "battery-full-symbolic"
+    return name
+
+
+def pixbuf_from_ref(ref, size=ICON_SIZE):
+    if not ref:
+        return None
+    try:
+        if os.path.isfile(ref):
+            return GdkPixbuf.Pixbuf.new_from_file_at_size(ref, size, size)
+        for name in (ref, "application-x-executable", "text-x-generic"):
+            try:
+                return Gtk.IconTheme.get_default().load_icon(name, size, Gtk.IconLookupFlags.FORCE_SIZE)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return _adwaita_pixbuf(ref, size)
+
+
+def _fallback_themes():
+    """Server icon theme obyektlari ro'yhati (birinchi — Adwaita, keyin moslashuvchanlar)."""
+    try:
+        if _fallback_themes.list is None:
+            lst = []
+            for nm in ("Adwaita", "elementary-xfce", "breeze", "default"):
+                try:
+                    t = Gtk.IconTheme.new()
+                    t.set_custom_theme(nm)
+                    lst.append(t)
+                except Exception:
+                    pass
+            _fallback_themes.list = lst
+        return _fallback_themes.list
+    except Exception:
+        return []
+
+_fallback_themes.list = None
+
+
+def theme_icon(name, size=16):
+    """Gtk.Image with robust icon-theme fallback (system -> Adwaita)."""
+    pb = pixbuf_from_ref(name, size) or _adwaita_pixbuf(name, size)
+    img = Gtk.Image()
+    if pb:
+        img.set_from_pixbuf(pb)
+    else:
+        img.set_from_icon_name(name, Gtk.IconSize.MENU)
+    return img
+
+
+def _adwaita_pixbuf(name, size=ICON_SIZE):
+    """Barqarorni ikonkalarni ol: avval system, uzra Adwaita va taniqlar."""
+    try:
+        themes = _fallback_themes()
+        for n in (name, "application-x-executable", "text-x-generic"):
+            for t in themes:
+                try:
+                    return t.load_icon(n, size, Gtk.IconLookupFlags.FORCE_SIZE)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+def _power_system(action="off"):
+    """Alpine-friendly poweroff/reboot with graceful escalation fallbacks."""
+    prog = "poweroff" if action in ("off", "poweroff") else "reboot"
+    loginctl = "poweroff" if action in ("off", "poweroff") else "reboot"
+    candidates = [
+        f"doas -n {prog}",
+        f"sudo -n {prog}",
+        f"pkexec {prog}",
+        f"loginctl {loginctl}",
+        prog,
+    ]
+    for cmd in candidates:
+        try:
+            if subprocess.call(["sh", "-c", cmd],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 # ---------- Wallpaper ----------
-# wallpaper.py
-# Robust Wallpaper widget for GTK3 (EventBox wrapper + parallax)
-import os
-from gi.repository import Gtk, GdkPixbuf, GLib
 
 class Wallpaper(Gtk.EventBox):
-    """
-    Wallpaper widget:
-      - uses Gtk.Image to show a scaled/cropped background image
-      - set_visible_window(False) so it doesn't steal input events
-      - optional parallax: set_parallax(True/False)
-      - set_parallax_offset(nx, ny) accepts values in [-1.0 .. 1.0]
-      - set_wallpaper(path) to load an image file
-    """
-
-    def __init__(self, path: str | None = None, parallax: bool = True, interactive: bool = False):
+    def __init__(self, path=None, parallax=True, interactive=False):
         super().__init__()
+        self.set_name("wallpaper")
 
-        # Do not create separate window for the EventBox (so it won't steal events)
         try:
             self.set_visible_window(False)
         except Exception:
             pass
 
-        # Make it non-interactive by default so clicks reach icons above
         if not interactive:
             try:
                 self.set_sensitive(False)
+                self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+                self.connect("button-press-event", lambda *_: True)
             except Exception:
                 pass
 
         self.image = Gtk.Image()
         self.add(self.image)
 
-        self._pb = None           # original GdkPixbuf of wallpaper
-        self._path = None         # path to current wallpaper
+        self._pb = None
+        self._path = None
         self._parallax_enabled = bool(parallax)
-        self._parallax_offset = (0.0, 0.0)   # (px, py) in [-1.0,1.0]
+        self._parallax_offset = (0.0, 0.0)
+        self._scaled = None
+        self._scaled_alloc = None
 
         if path:
             self.set_wallpaper(path)
 
-    # ---------------- public API ----------------
-    def set_parallax(self, enabled: bool = True):
+    def set_parallax(self, enabled=True):
         self._parallax_enabled = bool(enabled)
+        if not self._parallax_enabled:
+            self._update(self.get_allocation())
 
-    def set_parallax_offset(self, nx: float, ny: float):
-        """
-        nx, ny in [-1.0 .. 1.0] — relative offset for subtle parallax shift.
-        Calls update to re-render immediately (if allocation available).
-        """
+    def set_parallax_offset(self, nx=0.0, ny=0.0):
         try:
             nx = max(-1.0, min(1.0, float(nx)))
             ny = max(-1.0, min(1.0, float(ny)))
             self._parallax_offset = (nx, ny)
-            alloc = self.get_allocation()
-            if alloc and alloc.width > 0 and alloc.height > 0:
-                # schedule update in idle to avoid re-entrancy issues
-                GLib.idle_add(self._update, alloc)
+            self._update(self.get_allocation())
         except Exception:
             pass
 
-    def set_wallpaper(self, path: str | None):
-        """Set wallpaper to given filesystem path (or None to clear)."""
+    def get_path(self):
+        return self._path
+
+    def set_wallpaper(self, path=None):
         try:
             if not path or not os.path.exists(path):
                 self._path = None
                 self._pb = None
-                # fallback icon
+                self._scaled = None
                 try:
-                    self.image.set_from_icon_name("applications-graphics", Gtk.IconSize.DIALOG)
-                except Exception:
                     self.image.clear()
+                except Exception:
+                    pass
                 return
-
             self._path = path
-            # load pixbuf (may raise)
-            pb = GdkPixbuf.Pixbuf.new_from_file(path)
-            self._pb = pb
-            alloc = self.get_allocation()
-            if alloc and alloc.width > 0 and alloc.height > 0:
-                GLib.idle_add(self._update, alloc)
-            else:
-                # schedule update later when allocation is known
-                GLib.idle_add(self._update, self.get_allocation())
+            self._pb = GdkPixbuf.Pixbuf.new_from_file(path)
+            self._scaled = None
+            self._scaled_alloc = None
+            self._update(self.get_allocation())
         except Exception:
-            # on any load failure, clear
             self._pb = None
-            try:
-                self.image.set_from_icon_name("image-missing", Gtk.IconSize.DIALOG)
-            except Exception:
-                self.image.clear()
+            self._scaled = None
 
-    # ---------------- Gtk size handling ----------------
     def do_size_allocate(self, allocation):
-        # call parent's allocator
         try:
             Gtk.EventBox.do_size_allocate(self, allocation)
         except Exception:
             pass
-        # schedule update so scaling happens off the main reflow
         try:
             if self._pb:
-                GLib.idle_add(self._update, allocation)
+                GLib.idle_add(self._resize_scaled, allocation)
         except Exception:
             pass
 
-    # ---------------- internal update/render ----------------
-    def _update(self, allocation=None):
-        """
-        Render the wallpaper into the current allocation.
-        This can be called by GLib.idle_add with an allocation argument.
-        """
+    def _resize_scaled(self, allocation=None):
+        """Scale pixbuf once per allocation (with parallax margin), then crops are cheap."""
+        alloc = allocation or self.get_allocation()
+        w, h = alloc.width, alloc.height
+        if not self._pb or w <= 0 or h <= 0:
+            return False
+        mx = max(2, int(w * 0.05))
+        my = max(2, int(h * 0.05))
+        key = (w + 2 * mx, h + 2 * my)
+        if self._scaled_alloc == key and self._scaled:
+            return False
+        pbw, pbh = self._pb.get_width(), self._pb.get_height()
+        scale = max(key[0] / max(1, pbw), key[1] / max(1, pbh))
+        nw = max(1, int(round(pbw * scale)))
+        nh = max(1, int(round(pbh * scale)))
         try:
-            alloc = allocation if allocation else self.get_allocation()
-            if not alloc or alloc.width <= 0 or alloc.height <= 0:
-                return False
-
-            if not self._pb:
-                return False
-
-            pb = self._pb
-            w, h = alloc.width, alloc.height
-
-            # compute scale to cover the allocation (crop)
-            scale_x = w / max(1, pb.get_width())
-            scale_y = h / max(1, pb.get_height())
-            scale = max(scale_x, scale_y)
-
-            nw = max(1, int(round(pb.get_width() * scale)))
-            nh = max(1, int(round(pb.get_height() * scale)))
-
-            # scale the pixbuf
-            try:
-                scaled = pb.scale_simple(nw, nh, GdkPixbuf.InterpType.BILINEAR)
-            except Exception:
-                # fallback: use original if scaling fails
-                scaled = pb
-
-            # base center offsets
-            base_x = max(0, (nw - w) // 2)
-            base_y = max(0, (nh - h) // 2)
-
-            if self._parallax_enabled:
-                px, py = self._parallax_offset
-                # amount of shift is a small fraction of image size (not allocation)
-                # Using fraction of scaled image gives consistent subtle parallax
-                max_x = max(1, int(nw * 0.06))
-                max_y = max(1, int(nh * 0.06))
-                ox = base_x + int(px * max_x)
-                oy = base_y + int(py * max_y)
-                # clamp so we don't go out of bounds
-                ox = max(0, min(nw - w, ox))
-                oy = max(0, min(nh - h, oy))
-            else:
-                ox, oy = base_x, base_y
-
-            # create subpixbuf (crop)
-            try:
-                cropped = scaled.new_subpixbuf(ox, oy, min(w, nw), min(h, nh))
-                self.image.set_from_pixbuf(cropped)
-            except Exception:
-                # final fallback: set the scaled full image (it may be larger)
-                try:
-                    self.image.set_from_pixbuf(scaled)
-                except Exception:
-                    try:
-                        self.image.set_from_icon_name("image-missing", Gtk.IconSize.DIALOG)
-                    except Exception:
-                        self.image.clear()
-
+            self._scaled = self._pb.scale_simple(nw, nh, GdkPixbuf.InterpType.BILINEAR)
+            self._scaled_alloc = key
         except Exception:
-            # ignore errors silently to avoid UI crashes
-            pass
+            self._scaled = self._pb
+        self._update(alloc)
+        return False
 
-        # return False if called via idle_add (one-shot)
+    def _update(self, allocation=None):
+        alloc = allocation or self.get_allocation()
+        w, h = alloc.width, alloc.height
+        if w <= 0 or h <= 0 or not self._pb or not self._scaled:
+            return False
+
+        mx = max(2, int(w * 0.05))
+        my = max(2, int(h * 0.05))
+        scaled = self._scaled
+        sw, sh = scaled.get_width(), scaled.get_height()
+
+        ox0 = max(0, (sw - w) // 2)
+        oy0 = max(0, (sh - h) // 2)
+
+        if self._parallax_enabled:
+            px, py = self._parallax_offset
+            ox = max(0, min(sw - w, ox0 + int(px * mx)))
+            oy = max(0, min(sh - h, oy0 + int(py * my)))
+        else:
+            ox, oy = ox0, oy0
+
+        try:
+            cropped = scaled.new_subpixbuf(ox, oy, min(w, sw - ox), min(h, sh - oy))
+            self.image.set_from_pixbuf(cropped)
+        except Exception:
+            try:
+                self.image.set_from_pixbuf(scaled)
+            except Exception:
+                self.image.clear()
         return False
 
 
-# ---------- Launchpad (with search) ----------
+# ---------- Launchpad ----------
+
 class Launchpad(Gtk.Window):
     def __init__(self, parent):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.parent = parent
+        enable_rounded_window(self)
+        self.set_name("launchpad")
         self.set_transient_for(parent)
-        self.set_modal(True)
+        self.set_modal(False)
         self.set_decorated(False)
-        self.set_default_size(520, 420)
-        self.set_position(Gtk.WindowPosition.CENTER)
+        self.set_default_size(680, 520)
+        self.set_size_request(540, 420)
+        self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        box.set_border_width(12)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        box.set_border_width(24)
 
-        # search entry
         self.search = Gtk.Entry()
-        self.search.set_placeholder_text("Search apps...")
+        self.search.set_name("lp-search")
+        self.search.set_halign(Gtk.Align.CENTER)
+        self.search.set_width_chars(30)
+        self.search.set_placeholder_text("Search apps…")
+        try:
+            self.search.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, "edit-find-symbolic")
+            self.search.set_icon_sensitive(Gtk.EntryIconPosition.PRIMARY, False)
+        except Exception:
+            pass
         self.search.connect("changed", lambda e: self.populate(e.get_text()))
+        self.search.connect("activate", self._on_search_activate)
         box.pack_start(self.search, False, False, 0)
 
         sc = Gtk.ScrolledWindow()
         sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sc.set_name("lp-sc")
         grid = Gtk.FlowBox()
+        grid.set_name("lp-grid")
         grid.set_max_children_per_line(6)
-        grid.set_selection_mode(Gtk.SelectionMode.NONE)
+        grid.set_min_children_per_line(6)
+        grid.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        grid.set_valign(Gtk.Align.START)
         self._grid = grid
+        grid.connect("child-activated", self._on_child_activated)
         sc.add(grid)
         box.pack_start(sc, True, True, 0)
 
         self.add(box)
 
-        # handlers for escape / focus-out
         self.connect("key-press-event", self._on_key)
-        self.connect("focus-out-event", lambda w, e: self.hide())
-
+        self.connect("focus-in-event", self._on_focus_in)
+        self.connect("focus-out-event", self._on_focus_out)
+        self.show_all()
         self.populate()
+        self.hide()
+
+    def _title_for(self, t):
+        return {"FileManager": "Files"}.get(t, t)
 
     def populate(self, filter_text=""):
-        # rebuild grid with optional filter (fuzzy)
-        for c in list(self._grid.get_children()):
-            self._grid.remove(c)
+        try:
+            children = self._grid.get_children()
+            for c in children:
+                self._grid.remove(c)
+        except Exception:
+            pass
         ft = (filter_text or "").strip()
         titles = list(APPS.keys())
         if ft:
-            # use fuzzy matches first, fallback to substring
             matches = fuzzy_matches(ft, titles, cutoff=0.35)
             if not matches:
-                matches = [t for t in titles if ft.lower() in t.lower()]
+                matches = [t for t in titles if ft.lower() in t.lower() or ft.lower() in self._title_for(t).lower()]
         else:
             matches = titles
         for title in matches:
@@ -364,32 +520,101 @@ class Launchpad(Gtk.Window):
             btn = Gtk.Button()
             btn.set_relief(Gtk.ReliefStyle.NONE)
             btn.get_style_context().add_class("lp-tile")
-            img = load_icon(icon, size=56)
-            # label + icon
-            v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+            pb = pixbuf_from_ref(icon, 62)
+            img = Gtk.Image.new_from_pixbuf(pb) if pb else load_icon(icon, 48)
+            v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            v.set_halign(Gtk.Align.CENTER)
             v.pack_start(img, False, False, 0)
-            lbl = Gtk.Label(label=title)
+            lbl = Gtk.Label(label=self._title_for(title))
+            lbl.get_style_context().add_class("lp-label")
             lbl.set_xalign(0.5)
+            lbl.set_ellipsize(Pango.EllipsizeMode.END)
             v.pack_start(lbl, False, False, 0)
             btn.add(v)
             btn.set_tooltip_text(title)
             btn.connect("clicked", lambda _w, t=title: self._on_launch(t))
             self._grid.add(btn)
+            try:
+                btn.get_parent()._title = title
+            except Exception:
+                pass
         self.show_all()
 
-    def _on_launch(self, t):
-        self.hide()
+    def _on_child_activated(self, _grid, child):
         try:
+            title = getattr(child, "_title", None)
+            if title:
+                self._on_launch(title)
+        except Exception:
+            pass
+
+    def _on_search_activate(self, entry):
+        if not entry.get_text().strip():
+            return
+        try:
+            for child in self._grid.get_children():
+                try:
+                    btn = child.get_child() if isinstance(child, Gtk.FlowBoxChild) else child
+                    btn.activate()
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    def _on_launch(self, t):
+        try:
+            self.hide()
             self.parent.open_app(t)
         except Exception:
             info_dialog(self, "Xato", f"{t} ochib bo'lmadi")
 
     def _on_key(self, win, ev):
         try:
-            name = Gdk.keyval_name(ev.keyval)
-            if name and name.lower() == "escape":
-                self.hide()
+            name = (Gdk.keyval_name(ev.keyval) or "").lower()
+            if name == "escape":
+                self.hide_lp()
                 return True
+            if name in ("down", "kp_down", "up", "kp_up"):
+                children = self._grid.get_children()
+                if not children:
+                    return True
+                fwd = name.startswith(("down", "kp_down"))
+                sel = self._grid.get_selected_children()
+                try:
+                    cur = children.index(sel[0]) if sel else -1
+                except Exception:
+                    cur = -1
+                while True:
+                    cur = cur + (1 if fwd else -1)
+                    if not (0 <= cur < len(children)):
+                        if cur < 0:
+                            self.search.grab_focus()
+                        return True
+                    child = children[cur]
+                    try:
+                        self._grid.select_child(child)
+                        child.grab_focus()
+                        return True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        return False
+
+    def _on_focus_in(self, *_):
+        try:
+            self.parent.modal_backdrop.show_all()
+        except Exception:
+            pass
+        return False
+
+    def _on_focus_out(self, *_):
+        if not self.get_visible():
+            return False
+        try:
+            self.hide_lp()
         except Exception:
             pass
         return False
@@ -402,61 +627,92 @@ class Launchpad(Gtk.Window):
         self.populate("")
         fade_in(self)
         self.present()
-        GLib.idle_add(lambda: (self.search.grab_focus(), False))
+        GLib.idle_add(lambda: (self.search.grab_focus(), False)[1])
 
     def hide_lp(self):
         fade_out(self)
 
 
-# ---------- Spotlight search (Super+Space) ----------
+# ---------- Spotlight (Super+Space) ----------
+
 class Spotlight(Gtk.Window):
     def __init__(self, parent):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
         self.parent = parent
+        enable_rounded_window(self)
+        self.set_name("spotlight")
         self.set_transient_for(parent)
         self.set_decorated(False)
         self.set_modal(False)
-        self.set_default_size(640, 120)
+        self.set_default_size(620, 96)
+        self.set_size_request(520, 96)
         self.set_position(Gtk.WindowPosition.CENTER)
-        self.set_resizable(False)
+        self.set_resizable(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         box.set_border_width(10)
 
         self.entry = Gtk.Entry()
-        self.entry.set_placeholder_text("Search apps and Desktop files...")
+        self.entry.set_name("spotlight-entry")
+        self.entry.set_placeholder_text("Search apps and desktop files…")
+        self.entry.set_width_chars(44)
+        try:
+            self.entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, "edit-find-symbolic")
+            self.entry.set_icon_sensitive(Gtk.EntryIconPosition.PRIMARY, False)
+        except Exception:
+            pass
         self.entry.connect("changed", lambda e: self._on_change(e.get_text()))
         self.entry.connect("activate", lambda e: self._activate_selected())
-        box.pack_start(self.entry, False, False, 0)
+        box.pack_start(self.entry, False, False, 4)
 
         self.listbox = Gtk.ListBox()
+        self.listbox.set_name("spotlight-list")
         self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        try:
+            self.listbox.set_activate_on_single_click(True)
+        except Exception:
+            pass
+        self.listbox.connect("row-activated", lambda _lb, row: self._on_row_activate(getattr(row, "_item", None) or self._row_item(row)))
         sc = Gtk.ScrolledWindow()
         sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        sc.set_min_content_height(180)
+        sc.set_max_content_height(300)
+        sc.set_min_content_height(0)
         sc.add(self.listbox)
         box.pack_start(sc, True, True, 0)
 
         self.add(box)
         self.results = []
+        self._initial_win_pos = None
 
         self.connect("key-press-event", self._on_key)
         self.entry.connect("key-press-event", self._on_entry_key)
-        self.connect("focus-out-event", lambda w, e: self.hide())
-
+        self.connect("focus-out-event", self._on_focus_out)
         self.show_all()
+        self.hide()
 
     def show_spotlight(self):
         self.entry.set_text("")
         for w in list(self.listbox.get_children()):
             self.listbox.remove(w)
         self.results = []
+        try:
+            self.parent.modal_backdrop.hide()
+        except Exception:
+            pass
         fade_in(self)
         self.present()
-        GLib.idle_add(lambda: (self.entry.grab_focus(), False))
+        GLib.idle_add(lambda: (self.entry.grab_focus(), False)[1])
 
     def hide_spotlight(self):
         fade_out(self)
+
+    def _on_focus_out(self, *_):
+        if self.get_visible():
+            self.hide_spotlight()
+        return False
 
     def _on_change(self, text):
         q = (text or "").strip()
@@ -464,73 +720,102 @@ class Spotlight(Gtk.Window):
             self.listbox.remove(w)
         self.results = []
         if not q:
-            return
+            return True
         ql = q.lower()
-        # search apps (substring + fuzzy)
-        for title in APPS.keys():
-            if ql in title.lower():
-                self._append_result({"type": "app", "title": title, "payload": title})
-        # desktop files
+        titles = list(APPS.keys())
+        app_matches = [t for t in titles if ql in t.lower()] or fuzzy_matches(q, titles, 0.3)
+        for title in app_matches:
+            self._append_result({"type": "app", "title": self._title(title), "payload": title})
         try:
             if os.path.isdir(DESKTOP_FOLDER):
-                for f in sorted(os.listdir(DESKTOP_FOLDER), key=lambda x: x.lower()):
+                for f in sorted(os.listdir(DESKTOP_FOLDER), key=str.lower):
                     if ql in f.lower():
                         path = os.path.join(DESKTOP_FOLDER, f)
                         self._append_result({"type": "file", "title": f, "payload": path})
         except Exception:
             pass
+        try:
+            first = self.listbox.get_children()[0]
+            self.listbox.select_row(first)
+        except Exception:
+            pass
+        return False
+
+    def _title(self, t):
+        return {"FileManager": "Files"}.get(t, t)
+
+    def _row_item(self, row):
+        try:
+            idx = list(self.listbox.get_children()).index(row)
+        except Exception:
+            idx = -1
+        return self.results[idx] if 0 <= idx < len(self.results) else None
 
     def _append_result(self, item):
         row = Gtk.ListBoxRow()
-        h = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row._item = item
+        h = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        h.set_margin_left(10)
+        h.set_margin_right(10)
+        h.set_margin_top(4)
+        h.set_margin_bottom(4)
+        if item["type"] == "app":
+            icon = APPS.get(item["payload"], "application-x-executable")
+            pb = pixbuf_from_ref(icon, 22)
+            img = Gtk.Image.new_from_pixbuf(pb) if pb else load_icon(icon, 18)
+            h.pack_start(img, False, False, 0)
+        else:
+            pb = pixbuf_from_ref("text-x-generic", 22)
+            img = Gtk.Image.new_from_pixbuf(pb) if pb else load_icon("text-x-generic", 18)
+            h.pack_start(img, False, False, 0)
         lbl = Gtk.Label(label=item["title"])
         lbl.set_xalign(0)
+        lbl.set_ellipsize(Pango.EllipsizeMode.END)
         h.pack_start(lbl, True, True, 0)
         row.add(h)
-        row.connect("button-press-event", lambda w, e, it=item: self._on_row_activate(it) if e.type == Gdk.EventType.BUTTON_PRESS and e.button == 1 else None)
         self.listbox.add(row)
         self.results.append(item)
         self.show_all()
 
     def _on_row_activate(self, item):
+        if not item:
+            return
         if item["type"] == "app":
             try:
                 self.parent.open_app(item["payload"])
             except Exception:
                 info_dialog(self, "Xato", f"{item['payload']} ochib bo'lmadi")
         else:
-            path = item["payload"]
+            self._open_file(item["payload"])
+        self.hide_spotlight()
+
+    def _open_file(self, path):
+        try:
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = f.read(20000)
-                dlg = Gtk.Dialog(title=os.path.basename(path), transient_for=self.parent, flags=0)
-                dlg.add_button(Gtk.STOCK_CLOSE, Gtk.ResponseType.CLOSE)
-                dlg.set_default_size(720, 480)
-                nb = Notepad()
-                try:
-                    buf = nb.view.get_buffer()
-                    buf.set_text(data)
-                except Exception:
-                    pass
-                box = dlg.get_content_area()
-                box.add(nb)
-                dlg.show_all(); dlg.run(); dlg.destroy()
+                self.parent.open_app(None, payload=path)
             except Exception:
-                info_dialog(self.parent, "Open file", f"{path}")
+                pass
+        except Exception:
+            try:
+                subprocess.Popen(["xdg-open", path],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                info_dialog(self.parent, "Open file", path)
 
     def _activate_selected(self):
         sel = self.listbox.get_selected_row()
+        if not sel:
+            children = self.listbox.get_children()
+            sel = children[0] if children else None
         if sel:
-            idx = list(self.listbox.get_children()).index(sel)
-            if 0 <= idx < len(self.results):
-                self._on_row_activate(self.results[idx])
-                self.hide()
+            item = getattr(sel, "_item", None)
+            self._on_row_activate(item)
 
     def _on_key(self, win, ev):
         try:
-            name = Gdk.keyval_name(ev.keyval)
-            if name and name.lower() == "escape":
-                self.hide()
+            name = (Gdk.keyval_name(ev.keyval) or "").lower()
+            if name == "escape":
+                self.hide_spotlight()
                 return True
         except Exception:
             pass
@@ -538,9 +823,21 @@ class Spotlight(Gtk.Window):
 
     def _on_entry_key(self, entry, ev):
         try:
-            name = Gdk.keyval_name(ev.keyval)
-            if name and name.lower() == "escape":
-                self.hide()
+            name = (Gdk.keyval_name(ev.keyval) or "").lower()
+            if name == "escape":
+                self.hide_spotlight()
+                return True
+            if name in ("down", "uperrow"):
+                rows = self.listbox.get_children()
+                if rows:
+                    sel = self.listbox.get_selected_row()
+                    cur = rows.index(sel) if sel in rows else -1
+                    nxt = min(cur + 1, len(rows) - 1) if name == "down" else max(cur - 1, 0)
+                    self.listbox.select_row(rows[nxt])
+                    try:
+                        rows[nxt].get_child().focus(Gtk.DirectionType.UP)
+                    except Exception:
+                        pass
                 return True
         except Exception:
             pass
@@ -548,53 +845,45 @@ class Spotlight(Gtk.Window):
 
 
 # ---------- Desktop ----------
+
 class Desktop(Gtk.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title=APP_TITLE)
         self.set_default_size(1280, 800)
+        try:
+            settings = Gtk.Settings.get_default()
+            if settings:
+                settings.set_property("gtk-application-prefer-dark-theme", True)
+        except Exception:
+            pass
         self.set_position(Gtk.WindowPosition.CENTER)
 
-        # Ensure folders exist
         try:
             ensure_desktop_folder(DESKTOP_FOLDER)
             ensure_desktop_folder(os.path.dirname(STATE_FILE) or DESKTOP_FOLDER)
         except Exception:
             pass
 
-        # track open windows/dialogs as a list
         self.open_windows = []
-
-        # icon items: key -> (widget, path, is_app, app_name)
+        self._app_windows = {}
         self.desktop_items = {}
         self._dragging = None
 
-        # main overlay
         self.overlay = Gtk.Overlay()
         self.add(self.overlay)
 
-        # wallpaper widget (from PART1)
         self.wallpaper = Wallpaper(DEFAULT_WALLPAPER)
+        try:
+            self.wallpaper.set_halign(Gtk.Align.FILL)
+            self.wallpaper.set_valign(Gtk.Align.FILL)
+        except Exception:
+            pass
         self.overlay.add(self.wallpaper)
 
-        # modal backdrop (dim)
-        self.modal_backdrop = Gtk.EventBox()
-        self.modal_backdrop.set_name("modal-backdrop")
-        self.modal_backdrop.set_above_child(True)
-        self.overlay.add_overlay(self.modal_backdrop)
-        self.modal_backdrop.set_valign(Gtk.Align.FILL)
-        self.modal_backdrop.set_halign(Gtk.Align.FILL)
-        self.modal_backdrop.connect("button-press-event", lambda *_: self._hide_overlay_and_popups())
-        self.modal_backdrop.hide()
-
-        # mini status (clock/battery/network)
-        self._create_mini_status()
-
-        # icon layer (absolute placement)
         self.icon_layer = Gtk.Fixed()
         self.icon_layer.set_name("icon-layer")
         self.overlay.add_overlay(self.icon_layer)
 
-        # drag targets (use helper if available)
         try:
             targets = make_target_entries([("text/uri-list", 0, 0), ("text/plain", 0, 1)])
         except Exception:
@@ -602,32 +891,20 @@ class Desktop(Gtk.ApplicationWindow):
         self.icon_layer.drag_dest_set(Gtk.DestDefaults.ALL, targets, Gdk.DragAction.COPY)
         self.icon_layer.connect("drag-data-received", self.on_drag_data_received)
 
-        # bottom slim dock
-        dock = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        dock.set_name("slim-dock")
-        dock.set_halign(Gtk.Align.CENTER)
-        dock.set_valign(Gtk.Align.END)
-        dock.set_border_width(10)
-        lp_btn = Gtk.Button()
-        lp_btn.set_relief(Gtk.ReliefStyle.NONE)
-        lp_btn.set_tooltip_text("Launchpad")
-        lp_btn.set_image(load_icon("view-grid-symbolic", size=28))
-        lp_btn.connect("clicked", lambda *_: self.toggle_launchpad())
-        dock.pack_start(lp_btn, False, False, 0)
+        # dim backdrop sits above icons, below dock/top bar
+        self.modal_backdrop = Gtk.EventBox()
+        self.modal_backdrop.set_name("modal-backdrop")
+        self.modal_backdrop.set_above_child(True)
+        self.overlay.add_overlay(self.modal_backdrop)
+        self.modal_backdrop.connect("button-press-event", lambda *_: self._hide_overlay_and_popups())
+        self.modal_backdrop.hide()
 
-        for title, icon in APPS.items():
-            btn = Gtk.Button()
-            btn.set_relief(Gtk.ReliefStyle.NONE)
-            img = load_icon(icon, size=36)
-            btn.add(img)
-            btn.set_tooltip_text(title)
-            btn.connect("clicked", lambda _w, t=title: self.open_app(t))
-            dock.pack_start(btn, False, False, 0)
-        self.overlay.add_overlay(dock)
+        self._build_dock()
+        self.overlay.add_overlay(self._dock_evt)
 
-        # hot corner (top-right)
+        # hot corner
         hot = Gtk.EventBox()
-        hot.set_size_request(48, 48)
+        hot.set_size_request(44, 44)
         hot.set_name("hot-corner")
         hot.set_above_child(True)
         hot.set_halign(Gtk.Align.END)
@@ -635,7 +912,8 @@ class Desktop(Gtk.ApplicationWindow):
         hot.connect("button-press-event", lambda *_: self.toggle_launchpad())
         self.overlay.add_overlay(hot)
 
-        # Launchpad & Spotlight
+        self._create_top_bar()
+
         try:
             self.launchpad = Launchpad(self)
             self.spotlight = Spotlight(self)
@@ -643,11 +921,9 @@ class Desktop(Gtk.ApplicationWindow):
             self.launchpad = None
             self.spotlight = None
 
-        # parallax smoothing
         self._parallax_target = (0.0, 0.0)
-        GLib.timeout_add(16, self._parallax_step)
+        GLib.timeout_add(30, self._parallax_step)
 
-        # event masks and handlers
         self.add_events(
             Gdk.EventMask.POINTER_MOTION_MASK
             | Gdk.EventMask.BUTTON_PRESS_MASK
@@ -657,8 +933,8 @@ class Desktop(Gtk.ApplicationWindow):
         self.connect("motion-notify-event", self._on_motion)
         self.connect("button-release-event", self._on_release)
         self.connect("key-press-event", self._on_key_press)
+        self.connect("size-allocate", lambda *_: GLib.idle_add(self.wallpaper._resize_scaled))
 
-        # load state, style and show
         self.load_desktop_state()
         self.apply_css()
 
@@ -669,62 +945,310 @@ class Desktop(Gtk.ApplicationWindow):
         except Exception:
             pass
 
-        self.show_all()
+        fade_in(self, 240)
 
-    # ---------------- mini-status ----------------
-    def _create_mini_status(self):
-        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        status_box.set_name("mini-status")
+    # ---------------- top bar ----------------
+    def _create_top_bar(self):
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        bar.set_name("top-bar")
+        bar.set_halign(Gtk.Align.FILL)
+        bar.set_valign(Gtk.Align.START)
+        try:
+            bar.set_margin_top(8)
+            bar.set_margin_start(10)
+            bar.set_margin_end(10)
+            bar.set_margin_bottom(0)
+        except Exception:
+            pass
 
-        clock_box = Gtk.EventBox()
-        clock_box.set_name("mini-clock")
-        self.clock = Gtk.Label()
-        clock_box.add(self.clock)
-        status_box.pack_start(clock_box, False, False, 0)
+        brand = Gtk.Label(label="DragonOS")
+        brand.get_style_context().add_class("top-brand")
+        event = Gtk.EventBox()
+        event.add(brand)
+        event.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        event.connect("button-press-event", self._on_system_menu)
+        bar.pack_start(event, False, False, 2)
 
-        self.batt_lbl = Gtk.Label(label="🔋--%")
-        self.batt_lbl.set_name("mini-batt")
-        status_box.pack_start(self.batt_lbl, False, False, 0)
+        space = Gtk.Box()
+        bar.pack_start(space, True, True, 0)
 
-        self.net_lbl = Gtk.Label(label="🌐")
-        status_box.pack_start(self.net_lbl, False, False, 0)
+        self.batt_lbl = Gtk.Label(label="")
+        self.batt_lbl.get_style_context().add_class("top-chip")
 
-        self.overlay.add_overlay(status_box)
-        status_box.set_valign(Gtk.Align.START)
-        status_box.set_halign(Gtk.Align.END)
+        self.net_lbl = Gtk.Label(label="")
+        self.net_lbl.get_style_context().add_class("top-chip")
+
+        self.clock = Gtk.Label(label="")
+        self.clock.get_style_context().add_class("top-clock")
+        clock_click = Gtk.EventBox()
+        clock_click.add(self.clock)
+        clock_click.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+        clock_click.connect("button-press-event", self._on_system_menu)
+        clock_click.set_tooltip_text("System menu")
+
+        bar.pack_start(self.net_lbl, False, False, 0)
+        bar.pack_start(self.batt_lbl, False, False, 0)
+        bar.pack_start(clock_click, False, False, 2)
+
+        self.overlay.add_overlay(bar)
 
         GLib.timeout_add_seconds(1, self._update_clock)
+        self._update_clock()
+        self._update_status()
         GLib.timeout_add_seconds(30, self._update_status)
 
     def _update_clock(self):
-        from datetime import datetime
         try:
-            self.clock.set_text(datetime.now().strftime("%H:%M"))
+            now = datetime.now()
+            self.clock.set_text(now.strftime("%H:%M"))
+            self.net_lbl.set_tooltip_text(now.strftime("%A, %d %B %Y"))
         except Exception:
             pass
         return True
 
     def _update_status(self):
+        pct, charging = battery_state()
+        net = network_state()
         try:
-            self.batt_lbl.set_text("🔋 86%")
-            self.net_lbl.set_text("🌐 Wi-Fi")
+            if pct is None:
+                self.batt_lbl.set_text("")
+            else:
+                arrow = "⚡" if charging else ""
+                self.batt_lbl.set_text(f"{arrow}{pct}%")
+                self.batt_lbl.set_tooltip_text("Charging" if charging else "On battery")
+            net_name = {"wireless": "Wi-Fi", "wired": "Ethernet"}.get(net, "")
+            self.net_lbl.set_text(net_name)
+            self.net_lbl.set_tooltip_text(net_name or "No network")
         except Exception:
             pass
         return True
 
+    def _on_system_menu(self, widget, event=None):
+        menu = Gtk.Menu()
+
+        def item(label, cb, icon=None):
+            mi = Gtk.MenuItem(label=label)
+            if cb:
+                mi.connect("activate", cb)
+            menu.append(mi)
+
+        item("About DragonOS…", lambda *_: self._about_dialog())
+        item("Spotlight search", lambda *_: self.toggle_spotlight())
+        item("Launchpad", lambda *_: self.toggle_launchpad())
+        menu.append(Gtk.SeparatorMenuItem())
+
+        item("Lock screen", lambda *_: self._lock_screen())
+        item("Log out…", lambda *_: self._logout())
+        menu.append(Gtk.SeparatorMenuItem())
+        item("Restart…", lambda *_: self._confirm_power("reboot", "Restart"))
+        item("Power off…", lambda *_: self._confirm_power("off", "Power Off"))
+
+        menu.show_all()
+        try:
+            menu.popup_at_pointer(event)
+        except Exception:
+            try:
+                menu.popup(None, None, None, None, 0, Gtk.get_current_event_time() or 0)
+            except Exception:
+                pass
+        return True
+
+    def _about_dialog(self):
+        dlg = Gtk.MessageDialog(transient_for=self, flags=0, message_type=Gtk.MessageType.INFO,
+                                buttons=Gtk.ButtonsType.OK, text="DragonOS — Alpine Edition")
+        dlg.format_secondary_text(
+            "Beautiful & fast GTK3 desktop environment.\n\n"
+            "Shortcuts:\n  Super+L — Launchpad\n  Super+Space — Spotlight\n"
+            "  Ctrl+Alt+T — Terminal\n  Super+G — Snap grid\n"
+            "  Double-click desktop icon — open\n  Right-click — menu")
+        dlg.run()
+        dlg.destroy()
+
+    def _lock_screen(self):
+        try:
+            subprocess.Popen(["sh", "-c", "xdg-screensaver lock || loginctl lock-session"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    def _logout(self):
+        try:
+            if self.get_application():
+                self.get_application().quit()
+        except Exception:
+            pass
+
+    def _confirm_power(self, action, label):
+        dlg = Gtk.MessageDialog(transient_for=self, flags=0,
+                                message_type=Gtk.MessageType.WARNING,
+                                buttons=Gtk.ButtonsType.OK_CANCEL, text=f"{label} the system?")
+        dlg.set_modal(True)
+        dlg.format_secondary_text("Make sure unsaved work has been saved.")
+        resp = dlg.run()
+        dlg.destroy()
+        if resp == Gtk.ResponseType.OK:
+            if not _power_system("off" if action == "off" else "reboot"):
+                info_dialog(self, "DragonOS",
+                            f"Could not {label.lower()}.\n\nTry: doas { 'poweroff' if action=='off' else 'reboot' }")
+
+    # ---------------- dock ----------------
+    def _build_dock(self):
+        evt = Gtk.EventBox()
+        evt.set_name("dock-overlay")
+        evt.set_halign(Gtk.Align.CENTER)
+        evt.set_valign(Gtk.Align.END)
+        try:
+            evt.set_margin_bottom(12)
+        except Exception:
+            pass
+        evt.add_events(Gdk.EventMask.POINTER_MOTION_MASK)
+
+        dock = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        dock.set_name("slim-dock")
+        dock.set_border_width(6)
+        evt.add(dock)
+
+        sep0 = Gtk.Box()
+        sep0.get_style_context().add_class("dock-sep")
+        dock.pack_start(sep0, False, False, 1)
+
+        self.dock_items = {}
+
+        lp_btn = Gtk.Button()
+        lp_btn.set_relief(Gtk.ReliefStyle.NONE)
+        lp_btn.get_style_context().add_class("dock-btn")
+        lp_pb = pixbuf_from_ref("view-grid-symbolic", 40)
+        lp_img = Gtk.Image.new_from_pixbuf(lp_pb) if lp_pb else load_icon("view-grid-symbolic", 26)
+        lp_btn.set_image(lp_img)
+        lp_btn.set_tooltip_text("Launchpad (Super+L)")
+        lp_btn.connect("clicked", lambda *_: self.toggle_launchpad())
+        dock.pack_start(lp_btn, False, False, 0)
+
+        sep = Gtk.Box()
+        sep.get_style_context().add_class("dock-sep")
+        dock.pack_start(sep, False, False, 2)
+
+        for title, icon in APPS.items():
+            btn = Gtk.Button()
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.get_style_context().add_class("dock-btn")
+
+            pb = pixbuf_from_ref(icon, 44)
+            img = Gtk.Image.new_from_pixbuf(pb) if pb else load_icon(icon, 30)
+            btn.set_image(img)
+            btn.set_tooltip_text(title)
+            btn.connect("clicked", lambda _w, t=title: self._on_dock_click(t))
+
+            v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            v.pack_start(btn, False, False, 0)
+            dot_frame = Gtk.Box()
+            dot_frame.set_size_request(40, 6)
+            dot = Gtk.Image()
+            dot.get_style_context().add_class("dock-dot")
+            dot.set_pixel_size(6)
+            dot_frame.pack_start(dot, True, False, 0)
+            v.pack_start(dot_frame, False, False, 0)
+
+            try:
+                btn.set_size_request(44, 44)
+            except Exception:
+                pass
+
+            dock.pack_start(v, False, False, 0)
+            self.dock_items[title] = {"pb": pb, "img": img, "size": 44.0, "target": 44.0, "dot": dot, "btn": btn}
+
+        evt.connect("motion-notify-event", self._dock_magnify)
+        evt.connect("leave-notify-event", self._dock_restore)
+
+        self._dock_evt = evt
+        self._dock_box = dock
+
+        GLib.timeout_add(16, self._dock_tick)
+
+    def _on_dock_click(self, title):
+        wins = self._app_windows.get(title)
+        if wins:
+            try:
+                top = wins[-1]
+                if top.get_visible():
+                    top.present()
+                    return
+            except Exception:
+                pass
+        self.open_app(title)
+
+    def _dock_magnify(self, widget, ev):
+        try:
+            for title, it in self.dock_items.items():
+                btn = it["btn"]
+                try:
+                    cx = btn.translate_coordinates(widget, 0, 0)[0] + btn.get_allocated_width() / 2.0
+                except Exception:
+                    continue
+                d = abs(ev.x - cx)
+                if d > 110:
+                    it["target"] = 44.0
+                    continue
+                t = 1.0 - d / 110.0
+                it["target"] = 44.0 + 22.0 * t * t
+        except Exception:
+            pass
+
+    def _dock_restore(self, *_):
+        for it in self.dock_items.values():
+            it["target"] = 44.0
+
+    def _dock_tick(self):
+        try:
+            changed = any(abs(it["size"] - it["target"]) > 0.01 for it in self.dock_items.values())
+            for it in self.dock_items.values():
+                it["size"] += (it["target"] - it["size"]) * 0.35
+                if changed:
+                    s = int(round(max(16, it["size"])))
+                    if it["pb"]:
+                        try:
+                            it["img"].set_from_pixbuf(it["pb"].scale_simple(s, s, GdkPixbuf.InterpType.BILINEAR))
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            it["img"].set_pixel_size(s)
+                        except Exception:
+                            pass
+                    try:
+                        it["btn"].set_size_request(s, s)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self._dock_counts()
+        return True
+
+    def _dock_counts(self):
+        try:
+            open_titles = {t for t, wins in self._app_windows.items() if wins}
+            for title, it in self.dock_items.items():
+                want = title in open_titles
+                try:
+                    if want:
+                        it["dot"].set_pixel_size(6)
+                        it["dot"].show_all()
+                    else:
+                        it["dot"].hide()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     # ---------------- hide overlays ----------------
     def _hide_overlay_and_popups(self):
         try:
-            if getattr(self, "launchpad", None) and getattr(self.launchpad, "get_visible", lambda: False)():
-                try: self.launchpad.hide_lp()
-                except Exception:
-                    try: self.launchpad.hide()
-                    except Exception: pass
-            if getattr(self, "spotlight", None) and getattr(self.spotlight, "get_visible", lambda: False)():
-                try: self.spotlight.hide_spotlight()
-                except Exception:
-                    try: self.spotlight.hide()
-                    except Exception: pass
+            lp = getattr(self, "launchpad", None)
+            if lp is not None and lp.get_visible():
+                lp.hide_lp()
+            sp = getattr(self, "spotlight", None)
+            if sp is not None and sp.get_visible():
+                sp.hide_spotlight()
         except Exception:
             pass
         try:
@@ -732,44 +1256,64 @@ class Desktop(Gtk.ApplicationWindow):
         except Exception:
             pass
 
-    # ---------------- toggle launchpad ----------------
     def toggle_launchpad(self):
         lp = getattr(self, "launchpad", None)
-        sp = getattr(self, "spotlight", None)
         if lp is None:
             return
         try:
+            sp = getattr(self, "spotlight", None)
             if sp is not None and sp.get_visible():
-                try: sp.hide_spotlight()
-                except Exception: sp.hide()
+                sp.hide_spotlight()
+        except Exception:
+            pass
+        try:
+            if lp.get_visible():
+                lp.hide_lp()
+                self.modal_backdrop.hide()
+            else:
+                self.modal_backdrop.show_all()
+                lp.show_lp()
         except Exception:
             pass
 
+    def toggle_spotlight(self):
+        sp = getattr(self, "spotlight", None)
+        if sp is None:
+            return
         try:
-            visible = lp.get_visible() if hasattr(lp, "get_visible") else False
+            visible = sp.get_visible()
             if visible:
-                try: lp.hide_lp()
-                except Exception:
-                    try: lp.hide()
-                    except Exception: pass
-                try: self.modal_backdrop.hide()
-                except Exception: pass
+                sp.hide_spotlight()
             else:
-                try: self.modal_backdrop.show_all()
-                except Exception: pass
-                try: lp.populate()
-                except Exception: pass
-                try: lp.show_lp()
-                except Exception:
-                    try: lp.show_all(); lp.present()
-                    except Exception: pass
+                sp.show_spotlight()
         except Exception:
             pass
 
     # ---------------- window/app creation ----------------
-    def _make_window_for(self, widget, win_title=None, width=720, height=480):
+    def _register_window(self, key, w):
         try:
-            win_title = win_title or "App"
+            self.open_windows.append(w)
+            self._app_windows.setdefault(key, []).append(w)
+            w.connect("destroy", self._on_app_window_destroy, key)
+        except Exception:
+            pass
+
+    def _on_app_window_destroy(self, w, key):
+        try:
+            if w in self.open_windows:
+                self.open_windows.remove(w)
+        except Exception:
+            pass
+        try:
+            wins = self._app_windows.get(key, [])
+            if w in wins:
+                wins.remove(w)
+        except Exception:
+            pass
+
+    def _make_window_for(self, widget, win_title=None, width=720, height=480, app_key=None):
+        try:
+            key = app_key or win_title or "App"
             if isinstance(widget, Gtk.Dialog):
                 dlg = widget
                 try:
@@ -777,9 +1321,8 @@ class Desktop(Gtk.ApplicationWindow):
                     dlg.set_modal(False)
                 except Exception:
                     pass
-                dlg.show_all()
-                self.open_windows.append(dlg)
-                dlg.connect("destroy", lambda d: self._safe_remove_open_window(d))
+                fade_in(dlg, 180)
+                self._register_window(key, dlg)
                 dlg.present()
                 return dlg
 
@@ -793,48 +1336,50 @@ class Desktop(Gtk.ApplicationWindow):
                     parent.remove(widget)
             except Exception:
                 pass
-            try:
-                w.add(widget)
-            except Exception:
-                container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-                try:
-                    container.pack_start(widget, True, True, 0)
-                except Exception:
-                    container.pack_start(Gtk.Label(label="Could not embed widget"), True, True, 0)
-                w.add(container)
 
-            w.connect("destroy", lambda win: self._safe_remove_open_window(win))
-            w.show_all()
+            w.add(widget)
+            fade_in(w, 180)
+            self._register_window(key, w)
             w.present()
-            self.open_windows.append(w)
             return w
         except Exception as e:
-            try: info_dialog(self, "Xato", f"Oyna yaratishda xato:\n{e}")
-            except Exception: pass
+            try:
+                info_dialog(self, "Xato", f"Oyna yaratishda xato:\n{e}")
+            except Exception:
+                pass
             return None
-
-    def _safe_remove_open_window(self, win):
-        try:
-            if win in self.open_windows:
-                self.open_windows.remove(win)
-        except Exception:
-            pass
 
     def open_app(self, title, payload=None):
         try:
-            # Settings
-            if title == "Settings":
-                try:
-                    dlg_obj = SettingsDialog(self)
-                    if isinstance(dlg_obj, Gtk.Dialog):
+            self.modal_backdrop.hide()
+            if payload and title is None:
+                if os.path.isdir(payload):
+                    title = "FileManager"
+                else:
+                    _, ext = os.path.splitext(payload.lower())
+                    if ext in TEXT_EXTS:
+                        title = "Notepad"
+                    elif ext in IMAGE_EXTS or ext in VIDEO_EXTS:
+                        title = "Gallery"
+                    else:
                         try:
-                            dlg_obj.set_transient_for(self)
-                            dlg_obj.set_modal(False)
+                            if sys.platform.startswith("win"):
+                                os.startfile(payload)
+                            else:
+                                subprocess.Popen(["xdg-open", payload],
+                                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         except Exception:
                             pass
-                        dlg_obj.show_all()
-                        self.open_windows.append(dlg_obj)
-                        dlg_obj.connect("destroy", lambda d: self._safe_remove_open_window(d))
+                        return
+
+            if title == "Settings":
+                dlg_obj = SettingsDialog(self)
+                try:
+                    if isinstance(dlg_obj, Gtk.Dialog):
+                        dlg_obj.set_transient_for(self)
+                        dlg_obj.set_modal(False)
+                        fade_in(dlg_obj, 200)
+                        self._register_window("Settings", dlg_obj)
                         dlg_obj.present()
                         return
                     if hasattr(dlg_obj, "run") and callable(getattr(dlg_obj, "run")):
@@ -843,21 +1388,16 @@ class Desktop(Gtk.ApplicationWindow):
                         except Exception as e:
                             info_dialog(self, "Settings", f"Settings ochishda xato:\n{e}")
                         return
-                    try:
-                        self._make_window_for(dlg_obj, win_title="Settings", width=640, height=480)
-                        return
-                    except Exception:
-                        info_dialog(self, "Settings", "Settings oynasi ochilmadi")
-                        return
+                    self._make_window_for(dlg_obj, win_title="Settings", width=680, height=520, app_key="Settings")
+                    return
                 except Exception as e:
-                    try:
-                        SettingsDialog(self).run()
-                        return
-                    except Exception as e2:
-                        info_dialog(self, "Xato", f"Settings ochishda xatolik:\n{e}\n{e2}")
-                        return
+                    info_dialog(self, "Settings", f"Settings ochishda xato:\n{e}")
+                    return
 
-            # Notepad
+            if title == "Terminal":
+                self._open_terminal()
+                return
+
             if title == "Notepad":
                 nb = Notepad()
                 if payload and os.path.exists(payload):
@@ -872,73 +1412,98 @@ class Desktop(Gtk.ApplicationWindow):
                                 nb.load(payload)
                     except Exception:
                         pass
-                self._make_window_for(nb, win_title=(os.path.basename(payload) if payload else "Notepad"), width=720, height=480)
+                self._make_window_for(nb, win_title=(os.path.basename(payload) if payload else "Notepad"),
+                                      width=760, height=540, app_key="Notepad")
                 return
 
-            # Calculator
             if title == "Calculator":
                 calc = Calculator()
-                self._make_window_for(calc, win_title="Calculator", width=420, height=220)
+                self._make_window_for(calc, win_title="Calculator", width=380, height=460, app_key="Calculator")
                 return
 
-            # Gallery
             if title == "Gallery":
                 gal = Gallery()
                 if payload and os.path.exists(payload):
                     try:
-                        if hasattr(gal, "load"): gal.load(payload)
-                        elif hasattr(gal, "open_path"): gal.open_path(payload)
+                        if hasattr(gal, "load"):
+                            gal.load(payload)
+                        elif hasattr(gal, "open_path"):
+                            gal.open_path(payload)
                     except Exception:
                         pass
-                self._make_window_for(gal, win_title="Gallery", width=900, height=600)
+                self._make_window_for(gal, win_title="Gallery", width=900, height=620, app_key="Gallery")
                 return
 
-            # FileManager
             if title == "FileManager":
                 fm = FileManager()
                 if payload and os.path.exists(payload):
                     try:
-                        if hasattr(fm, "open_path"): fm.open_path(payload)
-                        elif hasattr(fm, "set_path"): fm.set_path(payload)
+                        if hasattr(fm, "open_path"):
+                            fm.open_path(payload)
+                        elif hasattr(fm, "set_path"):
+                            fm.set_path(payload)
                     except Exception:
                         pass
-                self._make_window_for(fm, win_title="File Manager", width=900, height=600)
+                self._make_window_for(fm, win_title="Files", width=900, height=620, app_key="FileManager")
                 return
 
-            # MusicPlayer
             if title == "MusicPlayer":
                 mp = MusicPlayer()
-                self._make_window_for(mp, win_title="MusicPlayer", width=720, height=480)
+                self._make_window_for(mp, win_title="MusicPlayer", width=760, height=520, app_key="MusicPlayer")
                 return
 
-            # If payload: route by type
             if payload:
                 if os.path.isdir(payload):
-                    self.open_app("FileManager", payload=payload); return
+                    self.open_app("FileManager", payload=payload)
+                    return
                 if os.path.exists(payload):
                     _, ext = os.path.splitext(payload.lower())
-                    text_exts = (".txt", ".py", ".md", ".json", ".log", ".cfg", ".ini")
-                    image_exts = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
-                    video_exts = (".mp4", ".mov", ".mkv", ".webm", ".avi")
-                    if ext in text_exts:
-                        self.open_app("Notepad", payload=payload); return
-                    if ext in image_exts or ext in video_exts:
-                        self.open_app("Gallery", payload=payload); return
+                    if ext in TEXT_EXTS:
+                        self.open_app("Notepad", payload=payload)
+                        return
+                    if ext in IMAGE_EXTS or ext in VIDEO_EXTS:
+                        self.open_app("Gallery", payload=payload)
+                        return
                     try:
-                        if sys.platform == "darwin":
-                            os.system(f'open "{payload}"')
-                        elif sys.platform.startswith("win"):
-                            os.startfile(payload)
-                        else:
-                            os.system(f'xdg-open "{payload}" &')
+                        subprocess.Popen(["xdg-open", payload],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         return
                     except Exception:
                         pass
 
             info_dialog(self, "Xato", f"{title} topilmadi yoki qo'llab-quvvatlanmaydi")
         except Exception as e:
-            try: info_dialog(self, "Xato", f"open_app ichida xato:\n{e}")
-            except Exception: pass
+            try:
+                info_dialog(self, "Xato", f"open_app ichida xato:\n{e}")
+            except Exception:
+                pass
+
+    def _open_terminal(self):
+        try:
+            from Terminal import TermTab
+            term = TermTab()
+            try:
+                view = getattr(getattr(term, "left", None), "text", None)
+                if view:
+                    view.set_name("term-view")
+            except Exception:
+                pass
+            w = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+            w.set_transient_for(self)
+            w.set_title("Terminal")
+            w.set_default_size(820, 520)
+            w.get_style_context().add_class("terminal-win")
+            try:
+                inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+                inner.add(term)
+                w.add(inner)
+            except Exception:
+                w.add(term)
+            fade_in(w, 160)
+            self._register_window("Terminal", w)
+            w.present()
+        except Exception as e:
+            info_dialog(self, "Terminal", f"Terminal ochib bo'lmadi:\n{e}")
 
     # ---------------- icon helpers ----------------
     def _get_icon_image_from_box(self, box):
@@ -946,44 +1511,34 @@ class Desktop(Gtk.ApplicationWindow):
             child = box.get_child()
             if child and isinstance(child, Gtk.Box):
                 kids = child.get_children()
-                if kids:
-                    maybe_img = kids[0]
-                    if isinstance(maybe_img, Gtk.Image):
-                        return maybe_img
+                if kids and isinstance(kids[0], Gtk.Image):
+                    return kids[0]
         except Exception:
             pass
         return None
 
     def add_desktop_item(self, path, x=50, y=50, is_app=False, app_name=None):
-        name = app_name if is_app else os.path.basename(path)
+        name = app_name if is_app else (os.path.basename(path) if path else "Unknown")
         box = Gtk.EventBox()
         box.set_name("desktop-icon")
+        box.get_style_context().add_class("desktop-icon")
 
         if is_app and app_name:
             icon_ref = APPS.get(app_name, "application-x-executable")
+        elif path and os.path.isdir(path):
+            icon_ref = "folder"
         else:
-            if os.path.isdir(path):
-                icon_ref = "folder"
+            _, ext = os.path.splitext(str(path or "").lower())
+            if ext in IMAGE_EXTS:
+                icon_ref = "image-x-generic"
+            elif ext in VIDEO_EXTS:
+                icon_ref = "video-x-generic"
             else:
-                _, ext = os.path.splitext(path.lower())
-                image_exts = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
-                video_exts = (".mp4", ".mov", ".mkv", ".webm", ".avi")
-                if ext in image_exts:
-                    icon_ref = "image-x-generic"
-                elif ext in video_exts:
-                    icon_ref = "video-x-generic"
-                else:
-                    icon_ref = "text-x-generic"
+                icon_ref = "text-x-generic"
 
-        img = load_icon(icon_ref, size=ICON_SIZE)
-        orig_pb = None
-        try:
-            if hasattr(img, "get_pixbuf"):
-                orig_pb = img.get_pixbuf()
-        except Exception:
-            orig_pb = None
+        pb = pixbuf_from_ref(icon_ref, ICON_SIZE)
+        img = Gtk.Image.new_from_pixbuf(pb) if pb else load_icon(icon_ref, ICON_SIZE)
 
-        # vbox: icon + label
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         vbox.set_halign(Gtk.Align.CENTER)
         vbox.set_valign(Gtk.Align.CENTER)
@@ -992,13 +1547,15 @@ class Desktop(Gtk.ApplicationWindow):
         lbl_text = name if len(name) <= 18 else name[:15] + "…"
         lbl = Gtk.Label(label=lbl_text)
         lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        lbl.set_width_chars(12)
         lbl.set_xalign(0.5)
         lbl.get_style_context().add_class("desktop-label")
         vbox.pack_start(lbl, False, False, 0)
 
         box.add(vbox)
         box._label = lbl
-        box._orig_pixbuf = orig_pb
+        box._icon_ref = icon_ref
+        box._size = ICON_SIZE
 
         try:
             self.icon_layer.put(box, int(x), int(y))
@@ -1009,7 +1566,6 @@ class Desktop(Gtk.ApplicationWindow):
                 pass
 
         box.show_all()
-        # use UUID for unique key
         key = f"{name}-{uuid.uuid4().hex[:8]}"
         self.desktop_items[key] = (box, path, is_app, app_name)
 
@@ -1022,84 +1578,71 @@ class Desktop(Gtk.ApplicationWindow):
         )
         box.connect("button-press-event", lambda wid, ev, k=key: self._on_icon_pressed(wid, ev, k))
         box.connect("button-release-event", lambda wid, ev, k=key: self._on_icon_released(wid, ev, k))
-        box.connect("enter-notify-event", lambda wid, ev: self._icon_hover_enter(wid))
-        box.connect("leave-notify-event", lambda wid, ev: self._icon_hover_leave(wid))
 
         self.save_desktop_state()
         return key
 
-    def _icon_hover_enter(self, widget):
-        try:
-            orig_pb = getattr(widget, "_orig_pixbuf", None)
-            img = self._get_icon_image_from_box(widget)
-            if orig_pb and img:
-                larger = orig_pb.scale_simple(max(1, int(ICON_SIZE * 1.25)), max(1, int(ICON_SIZE * 1.25)), GdkPixbuf.InterpType.BILINEAR)
-                img.set_from_pixbuf(larger)
-        except Exception:
-            pass
-
-    def _icon_hover_leave(self, widget):
-        try:
-            orig_pb = getattr(widget, "_orig_pixbuf", None)
-            img = self._get_icon_image_from_box(widget)
-            if orig_pb and img:
-                img.set_from_pixbuf(orig_pb.scale_simple(ICON_SIZE, ICON_SIZE, GdkPixbuf.InterpType.BILINEAR))
-        except Exception:
-            pass
-
-    # ---------------- dragging/moving ----------------
+    # ---------------- dragging / opening ----------------
     def _on_icon_pressed(self, widget, event, key):
+        if event.type == Gdk.EventType._2BUTTON_PRESS and event.button == 1:
+            entry = self.desktop_items.get(key)
+            if entry:
+                self._open_entry(entry)
+            self._dragging = None
+            return True
         if event.type == Gdk.EventType.BUTTON_PRESS and event.button == 1:
             try:
                 x, y = self.icon_layer.child_get_position(widget)
             except Exception:
                 x, y = 0, 0
-            self._dragging = {"key": key, "wid": widget, "sx": int(event.x_root), "sy": int(event.y_root), "ox": int(x), "oy": int(y)}
+            self._dragging = {"key": key, "wid": widget,
+                              "sx": int(event.x_root), "sy": int(event.y_root),
+                              "ox": int(x), "oy": int(y), "moved": False}
             return True
-        if event.button == 3:
+        if event.type == Gdk.EventType.BUTTON_PRESS and event.button == 3:
             return self.on_desktop_item_click(widget, event, key)
         return False
 
     def _on_icon_released(self, widget, event, key):
-        if self._dragging and self._dragging.get("key") == key:
-            try:
-                cur_x, cur_y = self.icon_layer.child_get_position(self._dragging["wid"])
-                if SNAP_TO_GRID:
-                    nx = int(round(cur_x / GRID_SIZE)) * GRID_SIZE
-                    ny = int(round(cur_y / GRID_SIZE)) * GRID_SIZE
-                    try:
-                        self.icon_layer.move(self._dragging["wid"], nx, ny)
-                    except Exception:
-                        try:
-                            self.icon_layer.put(self._dragging["wid"], nx, ny)
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            self.save_desktop_state()
-            self._dragging = None
-            return True
-        return False
+        drag = self._dragging
+        if not drag or drag.get("key") != key:
+            return False
+        try:
+            cur_x, cur_y = self.icon_layer.child_get_position(widget)
+            if SNAP_TO_GRID:
+                nx = int(round(cur_x / GRID_SIZE)) * GRID_SIZE
+                ny = int(round(cur_y / GRID_SIZE)) * GRID_SIZE
+                try:
+                    self.icon_layer.move(widget, nx, ny)
+                except Exception:
+                    self.icon_layer.put(widget, nx, ny)
+        except Exception:
+            pass
+        self.save_desktop_state()
+        self._dragging = None
+        return True
 
     def _on_motion(self, win, ev):
         try:
             alloc = self.get_allocation()
             if alloc and alloc.width > 0 and alloc.height > 0:
-                cx = alloc.width / 2.0
-                cy = alloc.height / 2.0
-                nx = (ev.x - cx) / max(1.0, cx)
-                ny = (ev.y - cy) / max(1.0, cy)
-                self._parallax_target = (nx * 0.6, ny * 0.6)
+                cx, cy = alloc.width / 2.0, alloc.height / 2.0
+                self._parallax_target = (
+                    (ev.x - cx) / max(1.0, cx) * 0.6,
+                    (ev.y - cy) / max(1.0, cy) * 0.6,
+                )
         except Exception:
             pass
 
         if not self._dragging:
             return False
-        dx = int(ev.x_root - self._dragging["sx"])
-        dy = int(ev.y_root - self._dragging["sy"])
-        nx = max(0, self._dragging["ox"] + dx)
-        ny = max(0, self._dragging["oy"] + dy)
         try:
+            dx = int(ev.x_root - self._dragging["sx"])
+            dy = int(ev.y_root - self._dragging["sy"])
+            if abs(dx) + abs(dy) > 3:
+                self._dragging["moved"] = True
+            nx = max(0, self._dragging["ox"] + dx)
+            ny = max(0, self._dragging["oy"] + dy)
             self.icon_layer.move(self._dragging["wid"], nx, ny)
         except Exception:
             pass
@@ -1107,15 +1650,13 @@ class Desktop(Gtk.ApplicationWindow):
 
     def _parallax_step(self):
         try:
-            curx, cury = getattr(self.wallpaper, "_parallax_offset", (0.0, 0.0))
+            curx, cury = self.wallpaper._parallax_offset
             tx, ty = self._parallax_target
-            nx = curx + (tx - curx) * 0.22
-            ny = cury + (ty - cury) * 0.22
-            try:
-                if hasattr(self.wallpaper, "set_parallax_offset"):
-                    self.wallpaper.set_parallax_offset(nx, ny)
-                self.wallpaper._parallax_offset = (nx, ny)
-            except Exception:
+            nx = curx + (tx - curx) * 0.18
+            ny = cury + (ty - cury) * 0.18
+            if abs(nx - curx) > 0.001 or abs(ny - cury) > 0.001:
+                self.wallpaper.set_parallax_offset(nx, ny)
+            else:
                 self.wallpaper._parallax_offset = (nx, ny)
         except Exception:
             pass
@@ -1124,8 +1665,9 @@ class Desktop(Gtk.ApplicationWindow):
     def _on_release(self, widget, event):
         if not getattr(self, "_dragging", None):
             return False
+        drag = self._dragging
         try:
-            wid = self._dragging.get("wid")
+            wid = drag.get("wid")
             cur_x, cur_y = self.icon_layer.child_get_position(wid)
             if SNAP_TO_GRID:
                 nx = int(round(cur_x / GRID_SIZE)) * GRID_SIZE
@@ -1133,10 +1675,7 @@ class Desktop(Gtk.ApplicationWindow):
                 try:
                     self.icon_layer.move(wid, nx, ny)
                 except Exception:
-                    try:
-                        self.icon_layer.put(wid, nx, ny)
-                    except Exception:
-                        pass
+                    self.icon_layer.put(wid, nx, ny)
         except Exception:
             pass
         try:
@@ -1153,145 +1692,129 @@ class Desktop(Gtk.ApplicationWindow):
             return False
         box, target, is_app, app_name = entry
 
-        # double-click left
-        if event.type == Gdk.EventType._2BUTTON_PRESS and event.button == 1:
-            if is_app and app_name:
-                self.open_app(app_name)
-            else:
-                self._open_entry(entry)
-            return True
+        menu = Gtk.Menu()
 
-        # right-click context menu
-        if event.type == Gdk.EventType.BUTTON_PRESS and event.button == 3:
-            menu = Gtk.Menu()
+        open_item = Gtk.MenuItem(label="Open")
+        open_item.connect("activate", lambda *_: self._open_entry(entry))
+        menu.append(open_item)
 
-            open_item = Gtk.MenuItem(label="Open")
-            open_item.connect("activate", lambda *_: self._open_entry(entry))
-            menu.append(open_item)
+        if not is_app and os.path.exists(target):
+            _, ext = os.path.splitext(target.lower())
+            if ext in TEXT_EXTS:
+                menu.append(self._mk_menu("Open in Notepad",
+                                          lambda *_: self.open_app("Notepad", payload=target)))
+            if ext in IMAGE_EXTS or ext in VIDEO_EXTS:
+                menu.append(self._mk_menu("Open in Gallery",
+                                          lambda *_: self.open_app("Gallery", payload=target)))
 
-            open_new = Gtk.MenuItem(label="Open in new window")
-            open_new.connect("activate", lambda *_: self._open_entry_new_window(entry))
-            menu.append(open_new)
+        menu.append(Gtk.SeparatorMenuItem())
 
-            # context-aware actions
-            if not is_app and os.path.exists(target):
-                _, ext = os.path.splitext(target.lower())
-                text_exts = (".txt", ".py", ".md", ".json", ".log", ".cfg", ".ini")
-                image_exts = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
-                video_exts = (".mp4", ".mov", ".mkv", ".webm", ".avi")
-                if ext in text_exts:
-                    itm = Gtk.MenuItem(label="Open in Notepad")
-                    itm.connect("activate", lambda *_: self.open_app("Notepad", payload=target))
-                    menu.append(itm)
-                if ext in image_exts or ext in video_exts:
-                    itm = Gtk.MenuItem(label="Open in Gallery")
-                    itm.connect("activate", lambda *_: self.open_app("Gallery", payload=target))
-                    menu.append(itm)
+        menu.append(self._mk_menu("Copy path", self._copy_clipboard(target)))
+        menu.append(self._mk_menu(
+            "Reveal in Files", self._reveal_in_files(target)))
+        menu.append(self._mk_menu("Rename", lambda *_: self._rename_entry(key)))
 
-            copy_path = Gtk.MenuItem(label="Copy path")
-            def _copy_path(_):
-                try:
-                    cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
-                    cb.set_text(target if target else "", -1)
-                except Exception:
-                    pass
-            copy_path.connect("activate", _copy_path)
-            menu.append(copy_path)
+        if not is_app and os.path.exists(target):
+            _, ext = os.path.splitext(target.lower())
+            if ext in IMAGE_EXTS:
+                menu.append(self._mk_menu("Set as wallpaper",
+                                          lambda *_: self._set_wallpaper_from_path(target)))
 
-            reveal = Gtk.MenuItem(label="Reveal in File Manager")
-            def _reveal(_):
-                try:
-                    folder = target if os.path.isdir(target) else os.path.dirname(target)
-                    if sys.platform == "darwin":
-                        os.system(f'open "{folder}"')
-                    elif sys.platform.startswith("win"):
-                        os.startfile(folder)
-                    else:
-                        os.system(f'xdg-open "{folder}" &')
-                except Exception:
-                    info_dialog(self, "Xato", f"Papkani ochib bo'lmadi: {folder}")
-            reveal.connect("activate", _reveal)
-            menu.append(reveal)
+        menu.append(Gtk.SeparatorMenuItem())
+        menu.append(self._mk_menu("Properties", lambda *_: self._show_properties(entry)))
+        menu.append(self._mk_menu("Remove", lambda *_: self.remove_desktop_item(key)))
 
-            rename_item = Gtk.MenuItem(label="Rename")
-            rename_item.connect("activate", lambda *_: self._rename_entry(key))
-            menu.append(rename_item)
+        menu.show_all()
+        try:
+            menu.popup_at_pointer(event)
+        except Exception:
+            menu.popup(None, None, None, None, event.button, event.time)
+        return True
 
-            set_wp = Gtk.MenuItem(label="Set as wallpaper")
-            set_wp.connect("activate", lambda *_: (self._set_wallpaper_from_path(target), self.save_desktop_state()))
-            menu.append(set_wp)
+    def _mk_menu(self, label, cb):
+        mi = Gtk.MenuItem(label=label)
+        mi.connect("activate", cb)
+        return mi
 
-            props = Gtk.MenuItem(label="Properties")
-            props.connect("activate", lambda *_: self._show_properties(entry))
-            menu.append(props)
-
-            remove_item = Gtk.MenuItem(label="Remove")
-            remove_item.connect("activate", lambda *_: self.remove_desktop_item(key))
-            menu.append(remove_item)
-
-            menu.show_all()
+    def _copy_clipboard(self, target):
+        def cb(_item):
             try:
-                menu.popup_at_pointer(event)
+                Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(str(target or ""), -1)
             except Exception:
-                menu.popup(None, None, None, None, event.button, event.time)
-            return True
+                pass
+        return cb
 
-        return False
+    def _reveal_in_files(self, target):
+        def cb(_item):
+            try:
+                folder = target if os.path.isdir(target) else os.path.dirname(target)
+                self.open_app("FileManager", payload=folder)
+            except Exception as e:
+                info_dialog(self, "Xato", f"Papkani ochib bo'lmadi: {e}")
+        return cb
 
     def _open_entry(self, entry):
         box, target, is_app, app_name = entry
         if is_app and app_name:
-            self.open_app(app_name); return
+            self.open_app(app_name)
+            return
+        if not target:
+            return
         if os.path.isdir(target):
-            self.open_app("FileManager", payload=target); return
-        if os.path.exists(target):
-            _, ext = os.path.splitext(target.lower())
-            text_exts = (".txt", ".py", ".md", ".json", ".log", ".cfg", ".ini")
-            image_exts = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
-            video_exts = (".mp4", ".mov", ".mkv", ".webm", ".avi")
-            if ext in text_exts:
-                self.open_app("Notepad", payload=target); return
-            if ext in image_exts or ext in video_exts:
-                self.open_app("Gallery", payload=target); return
-            try:
-                if sys.platform == "darwin":
-                    os.system(f'open "{target}"')
-                elif sys.platform.startswith("win"):
-                    os.startfile(target)
-                else:
-                    os.system(f'xdg-open "{target}" &')
-                return
-            except Exception:
-                info_dialog(self, "Xato", f"Faylni ochishda xato: {target}")
-                return
-        info_dialog(self, "Xato", "Fayl topilmadi")
-
-    def _open_entry_new_window(self, entry):
-        # behave same as _open_entry for now
-        self._open_entry(entry)
+            self.open_app("FileManager", payload=target)
+            return
+        if not os.path.exists(target):
+            info_dialog(self, "Xato", "Fayl topilmadi")
+            return
+        _, ext = os.path.splitext(target.lower())
+        if ext in TEXT_EXTS:
+            self.open_app("Notepad", payload=target)
+            return
+        if ext in IMAGE_EXTS or ext in VIDEO_EXTS:
+            self.open_app("Gallery", payload=target)
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(target)
+            else:
+                subprocess.Popen(["xdg-open", target],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            info_dialog(self, "Xato", f"Faylni ochishda xato: {target}")
 
     def _rename_entry(self, key):
         entry = self.desktop_items.get(key)
         if not entry:
             return
-        old_name = os.path.basename(entry[1])
+        old_name = os.path.basename(entry[1]) if entry[1] else ""
         dlg = Gtk.Dialog("Rename", transient_for=self, flags=0)
         dlg.add_button(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL)
         dlg.add_button(Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        dlg.set_default_size(380, 120)
+        dlg.set_modal(True)
         box = dlg.get_content_area()
+        box.set_border_width(12)
         e = Gtk.Entry()
         e.set_text(old_name)
+        e.set_activates_default(True)
         box.add(e)
+        ok = dlg.get_widget_for_response(Gtk.ResponseType.OK)
+        if ok:
+            dialog_default = ok.get_can_default()
         dlg.show_all()
+        try:
+            dlg.set_default(ok)
+        except Exception:
+            pass
         if dlg.run() == Gtk.ResponseType.OK:
             newname = e.get_text().strip()
             if newname:
                 try:
-                    newpath = os.path.join(os.path.dirname(entry[1]), newname)
+                    newpath = os.path.join(os.path.dirname(entry[1] or DESKTOP_FOLDER), newname)
                     os.rename(entry[1], newpath)
                     self.desktop_items[key] = (entry[0], newpath, entry[2], entry[3])
                     try:
-                        entry[0]._label.set_text(newname)
+                        entry[0]._label.set_text(newname[:18])
                     except Exception:
                         pass
                     self.save_desktop_state()
@@ -1302,12 +1825,15 @@ class Desktop(Gtk.ApplicationWindow):
     def _show_properties(self, entry):
         box, target, is_app, app_name = entry
         try:
-            st = os.stat(target) if os.path.exists(target) else None
-            dlg = Gtk.MessageDialog(transient_for=self, flags=0, message_type=Gtk.MessageType.INFO, buttons=Gtk.ButtonsType.OK, text=os.path.basename(target))
+            st = os.stat(target) if target and os.path.exists(target) else None
+            dlg = Gtk.MessageDialog(transient_for=self, flags=0, message_type=Gtk.MessageType.INFO,
+                                    buttons=Gtk.ButtonsType.OK,
+                                    text=os.path.basename(target) if target else "Unknown")
             body = [f"Path: {target}"]
             if st:
-                body.append(f"Size: {st.st_size} bytes")
-                body.append(f"Mode: {oct(st.st_mode)}")
+                sz = st.st_size
+                human = f"{sz/1024:.1f} KB" if sz < 1024 * 1024 else f"{sz/1024/1024:.2f} MB"
+                body += [f"Size: {sz} bytes ({human})", f"Mode: {oct(st.st_mode)}"]
             dlg.format_secondary_text("\n".join(body))
             dlg.run()
             dlg.destroy()
@@ -1331,8 +1857,7 @@ class Desktop(Gtk.ApplicationWindow):
 
     def _set_wallpaper_from_path(self, path):
         try:
-            if hasattr(self.wallpaper, "set_wallpaper"):
-                self.wallpaper.set_wallpaper(path)
+            self.wallpaper.set_wallpaper(path)
             self.save_desktop_state()
         except Exception as e:
             info_dialog(self, "Xato", f"Wallpaper o'rnatib bo'lmadi:\n{e}")
@@ -1340,20 +1865,16 @@ class Desktop(Gtk.ApplicationWindow):
     # ---------------- drag & drop ----------------
     def on_drag_data_received(self, widget, drag_context, x, y, selection_data, info, time):
         try:
-            uris = None
             try:
                 uris = selection_data.get_uris()
             except Exception:
                 uris = None
             if uris and len(uris) > 0:
-                # use GLib.filename_from_uri for robust decoding
                 u = uris[0]
                 try:
                     path = GLib.filename_from_uri(u)[0]
                 except Exception:
-                    path = u
-                    if u.startswith("file://"):
-                        path = u[7:]
+                    path = u[7:] if u.startswith("file://") else u
                 path = path.rstrip("\r\n")
                 if os.path.exists(path):
                     ensure_desktop_folder(DESKTOP_FOLDER)
@@ -1370,14 +1891,12 @@ class Desktop(Gtk.ApplicationWindow):
                         except (OSError, NotImplementedError):
                             shutil.copy2(path, dest)
                         self.add_desktop_item(dest, x, y, is_app=False)
-                        info_dialog(self, "Yaratildi", f"Desktop-ga qo‘yildi: {dest}")
                         drag_context.finish(True, False, time)
                         return
-                    except Exception as e:
-                        info_dialog(self, "Xato", f"Desktop-ga qo‘yib bo‘lmadi:\n{e}")
+                    except Exception:
+                        info_dialog(self, "Xato", "Desktop-ga qo'yib bo'lmadi")
                         drag_context.finish(False, False, time)
                         return
-            # fallback: plain text
             try:
                 text = selection_data.get_text()
             except Exception:
@@ -1386,10 +1905,12 @@ class Desktop(Gtk.ApplicationWindow):
                 text = text.strip()
                 if text in APPS:
                     self.add_desktop_item(text, x, y, is_app=True, app_name=text)
-                    drag_context.finish(True, False, time); return
+                    drag_context.finish(True, False, time)
+                    return
                 if os.path.exists(text):
                     self.add_desktop_item(text, x, y, is_app=False)
-                    drag_context.finish(True, False, time); return
+                    drag_context.finish(True, False, time)
+                    return
         except Exception:
             pass
         drag_context.finish(False, False, time)
@@ -1399,13 +1920,14 @@ class Desktop(Gtk.ApplicationWindow):
         try:
             ensure_desktop_folder(os.path.dirname(STATE_FILE) or DESKTOP_FOLDER)
             items = []
-            for k, v in self.desktop_items.items():
+            for k, v in list(self.desktop_items.items()):
                 widget = v[0]
                 try:
                     x, y = self.icon_layer.child_get_position(widget)
                 except Exception:
                     x, y = 50, 50
-                items.append({"path": v[1], "is_app": bool(v[2]), "app_name": v[3], "x": int(x), "y": int(y)})
+                items.append({"path": v[1], "is_app": bool(v[2]), "app_name": v[3],
+                              "x": int(x), "y": int(y)})
             with open(STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump({"items": items}, f, ensure_ascii=False, indent=2)
         except Exception:
@@ -1417,26 +1939,189 @@ class Desktop(Gtk.ApplicationWindow):
                 with open(STATE_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 for it in data.get("items", []):
-                    self.add_desktop_item(it.get("path"), it.get("x", 50), it.get("y", 50), is_app=it.get("is_app", False), app_name=it.get("app_name"))
+                    self.add_desktop_item(it.get("path"), it.get("x", 50), it.get("y", 50),
+                                          is_app=it.get("is_app", False),
+                                          app_name=it.get("app_name"))
         except Exception:
             pass
 
     # ---------------- styling & keyboard ----------------
     def apply_css(self):
         css = """
-        /* Minimal monochrome styling (GTK3-safe) */
-        #mini-clock { color: rgba(255,255,255,0.95); font-weight:600; padding:6px; margin:8px; background: rgba(0,0,0,0.18); border-radius:8px; }
-        #slim-dock { background: transparent; padding:8px; }
-        #desktop-icon { border: 0; padding: 6px; margin: 8px; background: rgba(0,0,0,0.14); border-radius: 10px; }
-        #desktop-icon image { margin:0; padding:0; }
-        #desktop-icon:hover { background: rgba(0,0,0,0.22); }
-        #desktop-icon .desktop-label { color: rgba(255,255,255,0.9); font-size: 11px; margin-top: 2px; }
-        .lp-tile { border-radius: 12px; padding: 10px; min-width: 120px; min-height: 120px; margin: 6px; background: rgba(255,255,255,0.02); }
-        .lp-tile:hover { margin-top: -6px; }
-        /* modal backdrop to dim the desktop when Launchpad/Spotlight open */
-        #modal-backdrop { background: rgba(8,8,8,0.52); }
+        /* ==== DragonOS glass theme (Alpine Edition) ==== */
+        window, #desktop-root { background: #0b0e13; }
+
+        #wallpaper { background: transparent; }
+
+        #modal-backdrop {
+          background: rgba(6, 8, 12, 0.55);
+        }
+
+        /* Top bar */
+        #top-bar {
+          padding: 2px 4px;
+          background: rgba(13, 16, 24, 0.60);
+          border-radius: 12px;
+          border: 1px solid rgba(255,255,255,0.09);
+          box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
+          transition: background 150ms ease-out;
+        }
+        #top-bar:hover { background: rgba(15, 19, 28, 0.72); }
+        .top-brand {
+          color: rgba(255,255,255,0.95);
+          font-weight: 700;
+          font-size: 12px;
+          padding: 0 8px;
+        }
+        .top-clock {
+          color: #ffffff;
+          font-weight: 600;
+          font-size: 12px;
+          padding: 3px 8px;
+        }
+        .top-chip {
+          color: rgba(235,242,255,0.88);
+          font-size: 11px;
+          font-weight: 500;
+          padding: 3px 8px;
+        }
+
+        /* Dock */
+        #slim-dock {
+          background: rgba(15, 18, 27, 0.62);
+          border-radius: 18px;
+          border: 1px solid rgba(255,255,255,0.10);
+          box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+        }
+        #dock-overlay { background: transparent; padding: 6px; }
+        .dock-btn { border-radius: 12px; background: transparent; padding: 5px; transition: all 120ms ease-out; }
+        .dock-btn:hover { background: rgba(255,255,255,0.10); }
+        .dock-btn:active { background: rgba(124,140,255,0.25); }
+        .dock-sep {
+          min-width: 2px; min-height: 30px; margin-top: 8px;
+          background: rgba(255,255,255,0.12); border-radius: 1px;
+        }
+        .dock-dot { color: #7c8cff; background: #7c8cff; border-radius: 3px; }
+
+        /* Desktop icons */
+        #desktop-icon {
+          border: 0;
+          padding: 6px; margin: 4px;
+          background: rgba(0,0,0,0.16);
+          border-radius: 12px;
+          transition: background 120ms ease-out;
+        }
+        #desktop-icon:hover { background: rgba(124,140,255,0.18); }
+        .desktop-label {
+          color: #ffffff;
+          font-size: 11px;
+          font-weight: 500;
+          margin-top: 2px;
+          text-shadow: none;
+        }
+
+        /* Launchpad */
+        #launchpad {
+          background: rgba(11, 14, 20, 0.90);
+          border-radius: 22px;
+          border: 1px solid rgba(255,255,255,0.10);
+        }
+        #lp-search {
+          background: rgba(255,255,255,0.08);
+          color: #ffffff;
+          border-radius: 999px;
+          padding: 8px 14px;
+          font-size: 13px;
+          border: 1px solid rgba(255,255,255,0.08);
+          caret-color: #7c8cff;
+        }
+        #lp-search:focus { background: rgba(255,255,255,0.12); }
+        #lp-sc, #lp-grid { background: transparent; }
+        .lp-tile {
+          border-radius: 18px;
+          padding: 14px 8px 10px 8px;
+          min-width: 96px;
+          background: rgba(255,255,255,0.03);
+          border: 1px solid rgba(255,255,255,0.05);
+          transition: all 130ms ease-out;
+        }
+        .lp-tile:hover {
+          background: rgba(124,140,255,0.16);
+          border-color: rgba(124,140,255,0.25);
+        }
+        .lp-tile:active { background: rgba(124,140,255,0.30); }
+        #lp-grid flowboxchild { border-radius: 18px; background: transparent; }
+        #lp-grid flowboxchild:selected { background: rgba(124,140,255,0.22); }
+        .lp-label { color: rgba(255,255,255,0.92); font-size: 11px; font-weight: 500; }
+
+        /* Spotlight */
+        #spotlight {
+          background: rgba(13, 16, 23, 0.92);
+          border-radius: 16px;
+          border: 1px solid rgba(255,255,255,0.12);
+        }
+        #spotlight-entry {
+          background: rgba(255,255,255,0.07);
+          color: #ffffff;
+          border-radius: 10px;
+          padding: 10px 12px;
+          font-size: 14px;
+          border: 1px solid rgba(255,255,255,0.08);
+          caret-color: #7c8cff;
+        }
+        #spotlight-entry:focus { background: rgba(255,255,255,0.11); }
+        #spotlight-list { background: transparent; }
+        #spotlight-list row {
+          background: transparent; border-radius: 10px;
+          color: #e8eefc; font-size: 12px;
+          transition: background 100ms;
+        }
+        #spotlight-list row:hover { background: rgba(255,255,255,0.06); }
+        #spotlight-list row:selected { background: rgba(124,140,255,0.28); }
+
         #hot-corner { background: transparent; }
-        #mini-status { margin: 8px; }
+
+        /* Terminal window */
+        .terminal-win { background: #0d1117; }
+        #term-view, #term-view text {
+          background: #0d1117;
+          color: #e6edf3;
+          font-family: "SFMono-Regular", "DejaVu Sans Mono", monospace;
+          font-size: 12px;
+        }
+
+        /* Windows & dialogs */
+        dialog { background: #12151c; color: #e8eefc; }
+        messagedialog { border-radius: 14px; }
+        button {
+          background: rgba(255,255,255,0.05);
+          color: #e8eefc;
+          border-radius: 10px;
+          border: 1px solid rgba(255,255,255,0.06);
+          padding: 7px 12px;
+          transition: all 120ms ease-out;
+        }
+        button:hover { background: rgba(255,255,255,0.10); }
+        button:active { background: rgba(124,140,255,0.28); }
+        entry {
+          background: rgba(255,255,255,0.07);
+          color: #ffffff;
+          border-radius: 10px;
+          padding: 8px 10px;
+          border: 1px solid rgba(255,255,255,0.06);
+          caret-color: #7c8cff;
+        }
+        entry:focus { background: rgba(255,255,255,0.11); }
+        combobox { color: #e8eefc; }
+        label { color: #dfe7f3; }
+        frame { border-radius: 12px; }
+        scrollbar { background: transparent; }
+        scrollbar slider {
+          background: rgba(255,255,255,0.22);
+          border-radius: 8px;
+          min-width: 6px;
+          min-height: 24px;
+        }
         """
         try:
             prov = Gtk.CssProvider()
@@ -1449,7 +2134,7 @@ class Desktop(Gtk.ApplicationWindow):
     def apply_dark_icon_backdrop(self, enable=True):
         try:
             if enable:
-                css = "#desktop-icon { background: rgba(0,0,0,0.18); padding:6px; border-radius:10px; }"
+                css = "#desktop-icon { background: rgba(0,0,0,0.18); padding:6px; border-radius:12px; }"
             else:
                 css = "#desktop-icon { background: transparent; padding: 0; }"
             prov = Gtk.CssProvider()
@@ -1459,38 +2144,41 @@ class Desktop(Gtk.ApplicationWindow):
         except Exception:
             pass
 
+    def toggle_dark(self, on=True):
+        try:
+            Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", bool(on))
+        except Exception:
+            pass
+
     def _on_key_press(self, widget, ev):
         name = (Gdk.keyval_name(ev.keyval) or "").lower()
         state = ev.state
         try:
             super_mask = (Gdk.ModifierType.SUPER_MASK | Gdk.ModifierType.MOD4_MASK | Gdk.ModifierType.META_MASK)
             is_super = bool(state & super_mask)
+            ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+            alt = bool(state & Gdk.ModifierType.MOD1_MASK)
+
             if name == "g" and is_super:
                 global SNAP_TO_GRID
                 SNAP_TO_GRID = not SNAP_TO_GRID
                 info_dialog(self, "Grid", f"Snap-to-grid: {SNAP_TO_GRID}")
                 return True
             if name == "space" and is_super:
-                if getattr(self, "spotlight", None) and getattr(self.spotlight, "get_visible", lambda: False)():
-                    try: self.spotlight.hide_spotlight()
-                    except Exception: self.spotlight.hide()
-                else:
-                    if getattr(self, "spotlight", None): self.spotlight.show_spotlight()
+                self.toggle_spotlight()
                 return True
-            if name == "l" and is_super:
-                self.toggle_launchpad(); return True
+            if name in ("l", "a") and is_super:
+                self.toggle_launchpad()
+                return True
+            if name == "t" and ctrl and alt:
+                self._open_terminal()
+                return True
             if name == "escape":
-                if getattr(self, "launchpad", None) and getattr(self.launchpad, "get_visible", lambda: False)():
-                    try: self.launchpad.hide(); self.modal_backdrop.hide()
-                    except Exception: pass
-                    return True
-                if getattr(self, "spotlight", None) and getattr(self.spotlight, "get_visible", lambda: False)():
-                    try: self.spotlight.hide(); self.modal_backdrop.hide()
-                    except Exception: pass
-                    return True
+                self._hide_overlay_and_popups()
+                return True
         except Exception:
             pass
         return False
 
-# export
-__all__ = ["Desktop", "DESKTOP_FOLDER"]
+
+__all__ = ["Desktop", "DESKTOP_FOLDER", "Wallpaper", "Launchpad", "Spotlight"]

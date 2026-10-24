@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=DragonOS UI
+Name[uz]=DragonOS Interfeys
+GenericName=Desktop Environment
+Comment=Beautiful & fast GTK3 desktop UI for Alpine Linux
+Exec=/usr/local/bin/dragon-os
+TryExec=/usr/local/bin/dragon-os
+Icon=applications-graphics
+Terminal=false
+Categories=System;DesktopEnvironment;Utility;
+StartupWMClass=DragonOS
+X-Purism-FormFactor=Workstation;
